@@ -19,13 +19,17 @@ from ironic_inspector.common.i18n import _, _LW
 from ironic_inspector.common import ironic as ir_utils
 from ironic_inspector import node_cache
 from ironic_inspector import utils
-
+import json
 
 DISCOVERY_OPTS = [
     cfg.StrOpt('enroll_node_driver',
                default='fake',
                help=_('The name of the Ironic driver used by the enroll '
                       'hook when creating a new node in Ironic.')),
+    cfg.StrOpt('driver_defaults',
+               default='{}',
+               help=_('Defaults for the driver as json')
+               ),
 ]
 
 
@@ -41,7 +45,12 @@ LOG = utils.getProcessingLogger(__name__)
 
 
 def _extract_node_driver_info(introspection_data):
-    node_driver_info = {}
+    try:
+        node_driver_info = json.loads(CONF.discovery.driver_defaults)
+    except ValueError:
+        LOG.warn(_LW('Could not parse discovery.driver_defaults'))
+        node_driver_info = {}
+
     ipmi_address = utils.get_ipmi_address_from_data(introspection_data)
     if ipmi_address:
         node_driver_info['ipmi_address'] = ipmi_address
