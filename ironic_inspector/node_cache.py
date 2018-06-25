@@ -16,6 +16,7 @@
 import collections
 import contextlib
 import copy
+import time
 import datetime
 import json
 
@@ -877,6 +878,7 @@ def clean_up():
     if timeout <= 0:
         return []
     threshold = timeutils.utcnow() - datetime.timedelta(seconds=timeout)
+    threshold = time.mktime(threshold.timetuple())  # workaround for postgres
     uuids = [row.uuid for row in
              db.model_query(db.Node.uuid).filter(
                  db.Node.started_at < threshold,
