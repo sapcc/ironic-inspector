@@ -42,3 +42,5 @@ ChangeLog
 
 # Vagrant
 .vagrant
+
+venv/
