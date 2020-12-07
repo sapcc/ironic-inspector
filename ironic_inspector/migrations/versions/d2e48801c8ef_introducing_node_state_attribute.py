@@ -18,17 +18,18 @@ Create Date: 2016-07-29 10:10:32.351661
 
 """
 
-# revision identifiers, used by Alembic.
-revision = 'd2e48801c8ef'
-down_revision = 'e169a4a81d88'
-branch_labels = None
-depends_on = None
-
 from alembic import op
 import sqlalchemy as sa
 from sqlalchemy import sql
 
 from ironic_inspector import introspection_state as istate
+
+
+# revision identifiers, used by Alembic.
+revision = 'd2e48801c8ef'
+down_revision = 'e169a4a81d88'
+branch_labels = None
+depends_on = None
 
 Node = sql.table('nodes',
                  sql.column('error', sa.String),
@@ -36,10 +37,12 @@ Node = sql.table('nodes',
 
 
 def upgrade():
+    state_enum = sa.Enum(*istate.States.all(), name='node_state')
+    state_enum.create(op.get_bind())
+
     op.add_column('nodes', sa.Column('version_id', sa.String(36),
                                      server_default=''))
-    op.add_column('nodes', sa.Column('state', sa.Enum(*istate.States.all(),
-                                                      name='node_state'),
+    op.add_column('nodes', sa.Column('state', state_enum,
                                      nullable=False,
                                      default=istate.States.finished,
                                      server_default=istate.States.finished))

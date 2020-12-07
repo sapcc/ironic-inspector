@@ -18,6 +18,8 @@ from automaton import machines
 
 class States(object):
     """States of an introspection."""
+    # received a request to abort the introspection
+    aborting = 'aborting'
     # received introspection data from a nonexistent node
     # active - the inspector performs an operation on the node
     enrolling = 'enrolling'
@@ -44,7 +46,7 @@ class States(object):
     def all(cls):
         """Return a list of all states."""
         return [cls.starting, cls.waiting, cls.processing, cls.finished,
-                cls.error, cls.reapplying, cls.enrolling]
+                cls.error, cls.reapplying, cls.enrolling, cls.aborting]
 
 
 class Events(object):
@@ -52,6 +54,9 @@ class Events(object):
     # cancel a waiting node introspection
     # API, user
     abort = 'abort'
+    # finish the abort request
+    # internal
+    abort_end = 'abort_end'
     # mark an introspection failed
     # internal
     error = 'error'
@@ -80,13 +85,22 @@ class Events(object):
         return [cls.process, cls.reapply, cls.timeout, cls.wait, cls.abort,
                 cls.error, cls.finish]
 
+
 # Error transition is allowed in any state.
 State_space = [
+    {
+        'name': States.aborting,
+        'next_states': {
+            Events.abort_end: States.error,
+            Events.timeout: States.error,
+        }
+    },
     {
         'name': States.enrolling,
         'next_states': {
             Events.error: States.error,
             Events.process: States.processing,
+            Events.timeout: States.error,
         },
     },
     {
@@ -111,6 +125,7 @@ State_space = [
         'next_states': {
             Events.error: States.error,
             Events.finish: States.finished,
+            Events.timeout: States.error,
         },
     },
     {
@@ -119,20 +134,21 @@ State_space = [
             Events.error: States.error,
             Events.finish: States.finished,
             Events.reapply: States.reapplying,
+            Events.timeout: States.error,
         },
     },
     {
         'name': States.starting,
         'next_states': {
             Events.error: States.error,
-            Events.start: States.starting,
             Events.wait: States.waiting,
+            Events.timeout: States.error
         },
     },
     {
         'name': States.waiting,
         'next_states': {
-            Events.abort: States.error,
+            Events.abort: States.aborting,
             Events.process: States.processing,
             Events.start: States.starting,
             Events.timeout: States.error,

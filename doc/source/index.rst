@@ -1,40 +1,23 @@
 .. include:: ../../README.rst
 
-User Guide
-===========
+Using Ironic Inspector
+======================
 
 .. toctree::
   :maxdepth: 2
 
-  Workflow <workflow>
-  Usage <usage>
-  HTTP API <http-api>
-  Troubleshooting <troubleshooting>
+  install/index
+  configuration/index
+  user/index
+  admin/index
 
-Admin Guide
-===========
-
-.. toctree::
-  :maxdepth: 2
-
-  Installation <install>
-  Upgrade <upgrade>
-
-Developer Guide
-===============
+Contributor Docs
+================
 
 .. toctree::
   :maxdepth: 2
 
-  Contributing <contributing>
-
-Python API
-----------
-
-.. toctree::
-  :maxdepth: 1
-
-  api/autoindex
+  contributor/index
 
 Indices and tables
 ==================

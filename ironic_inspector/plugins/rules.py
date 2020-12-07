@@ -17,10 +17,14 @@ import operator
 import re
 
 import netaddr
+from openstack import exceptions as os_exc
 
 from ironic_inspector.common.i18n import _
 from ironic_inspector.plugins import base
 from ironic_inspector import utils
+
+
+LOG = utils.getProcessingLogger(__name__)
 
 
 def coerce(value, expected):
@@ -115,14 +119,45 @@ class FailAction(base.RuleActionPlugin):
 
 
 class SetAttributeAction(base.RuleActionPlugin):
-    REQUIRED_PARAMS = {'path', 'value'}
+    # NOTE(iurygregory): set as optional to accept None as value, check
+    # that the key 'value' is present, otherwise will raise ValueError.
+    OPTIONAL_PARAMS = {'value', 'reset_interfaces'}
+    REQUIRED_PARAMS = {'path'}
     # TODO(dtantsur): proper validation of path
 
     FORMATTED_PARAMS = ['value']
 
     def apply(self, node_info, params, **kwargs):
-        node_info.patch([{'op': 'add', 'path': params['path'],
-                          'value': params['value']}])
+        kwargs = {}
+        if (params['path'].strip('/') == 'driver'
+                and ('reset_interfaces' not in params
+                     or params['reset_interfaces'])):
+            # Using at least Rocky
+            kwargs['reset_interfaces'] = True
+
+        try:
+            node_info.patch([{'op': 'add', 'path': params['path'],
+                              'value': params['value']}], **kwargs)
+        except (TypeError, os_exc.SDKException):
+            # TODO(dtantsur): remove support for old ironicclient and Queens
+            if 'reset_interfaces' in params:
+                # An explicit request, report an error.
+                raise utils.Error(
+                    _('Cannot pass reset_interfaces to set-attribute, '
+                      'requires API 1.46 and ironicclient >= 2.5.0'))
+
+            LOG.warning('Not passing reset_interfaces to Ironic, since '
+                        ' API 1.46 and/or ironicclient >= 2.5.0 are '
+                        'not available', node_info=node_info)
+            node_info.patch([{'op': 'add', 'path': params['path'],
+                              'value': params['value']}])
+
+    def validate(self, params, **kwargs):
+        if 'value' in params:
+            super(base.RuleActionPlugin, self).validate(params, **kwargs)
+        else:
+            msg = _('missing required parameter(s): value')
+            raise ValueError(msg)
 
 
 class SetCapabilityAction(base.RuleActionPlugin):
@@ -151,3 +186,17 @@ class ExtendAttributeAction(base.RuleActionPlugin):
             return values
 
         node_info.replace_field(params['path'], _replace, default=[])
+
+
+class AddTraitAction(base.RuleActionPlugin):
+    REQUIRED_PARAMS = {'name'}
+
+    def apply(self, node_info, params, **kwargs):
+        node_info.add_trait(params['name'])
+
+
+class RemoveTraitAction(base.RuleActionPlugin):
+    REQUIRED_PARAMS = {'name'}
+
+    def apply(self, node_info, params, **kwargs):
+        node_info.remove_trait(params['name'])

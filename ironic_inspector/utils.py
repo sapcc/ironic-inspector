@@ -15,15 +15,18 @@ import datetime
 import logging as pylog
 
 import futurist
+from ironic_lib import auth_basic
+from ironic_lib import exception
 from keystonemiddleware import auth_token
+from openstack.baremetal.v1 import node
 from oslo_config import cfg
 from oslo_log import log
 from oslo_middleware import cors as cors_middleware
 import pytz
+import webob
 
-from ironicclient.v1 import node
-from ironic_inspector.common.i18n import _, _LE
-from ironic_inspector import conf  # noqa
+from ironic_inspector.common.i18n import _
+from ironic_inspector import policy
 
 CONF = cfg.CONF
 
@@ -32,9 +35,28 @@ _EXECUTOR = None
 
 def get_ipmi_address_from_data(introspection_data):
     try:
-        return introspection_data['inventory']['bmc_address']
+        result = introspection_data['inventory']['bmc_address']
     except KeyError:
-        return introspection_data.get('ipmi_address')
+        result = introspection_data.get('ipmi_address')
+
+    if result in ('', '0.0.0.0'):
+        # ipmitool can return these values, if it does not know the address
+        return None
+    else:
+        return result
+
+
+def get_ipmi_v6address_from_data(introspection_data):
+    try:
+        result = introspection_data['inventory']['bmc_v6address']
+    except KeyError:
+        result = introspection_data.get('ipmi_v6address')
+
+    if result in ('', '::/0'):
+        # ipmitool can return these values, if it does not know the address
+        return None
+    else:
+        return result
 
 
 def get_pxe_mac(introspection_data):
@@ -72,10 +94,9 @@ def processing_logger_prefix(data=None, node_info=None):
     if pxe_mac:
         parts.append('MAC %s' % pxe_mac)
 
-    if CONF.processing.log_bmc_address:
-        bmc_address = get_ipmi_address_from_data(data) if data else None
-        if bmc_address:
-            parts.append('BMC %s' % bmc_address)
+    bmc_address = get_ipmi_address_from_data(data) if data else None
+    if bmc_address:
+        parts.append('BMC %s' % bmc_address)
 
     if parts:
         return _('[node: %s]') % ' '.join(parts)
@@ -135,6 +156,57 @@ class NodeStateInvalidEvent(Error):
     """Invalid event attempted."""
 
 
+class IntrospectionDataStoreDisabled(Error):
+    """Introspection data store is disabled."""
+
+
+class IntrospectionDataNotFound(NotFoundInCacheError):
+    """Introspection data not found."""
+
+
+class NoAvailableConductor(Error):
+    """No available conductor in the service group."""
+
+    def __init__(self, msg, **kwargs):
+        super(NoAvailableConductor, self).__init__(msg, code=503, **kwargs)
+
+
+class DeferredBasicAuthMiddleware(object):
+    """Middleware which sets X-Identity-Status header based on authentication
+
+    """
+    def __init__(self, app, auth_file):
+        self.app = app
+        self.auth_file = auth_file
+        auth_basic.validate_auth_file(auth_file)
+
+    @webob.dec.wsgify()
+    def __call__(self, req):
+
+        headers = req.headers
+        try:
+            if 'Authorization' not in headers:
+                auth_basic.unauthorized()
+
+            token = auth_basic.parse_header({
+                'HTTP_AUTHORIZATION': headers.get('Authorization')
+            })
+            username, password = auth_basic.parse_token(token)
+            headers.update(
+                auth_basic.authenticate(self.auth_file, username, password))
+            headers['X-Identity-Status'] = 'Confirmed'
+
+        except exception.Unauthorized:
+            headers['X-Identity-Status'] = 'Invalid'
+        except exception.IronicException as e:
+            status = '%s %s' % (int(e.code), str(e))
+            resp = webob.Response(status=status)
+            resp.headers.update(e.headers)
+            return resp
+
+        return req.get_response(self.app)
+
+
 def executor():
     """Return the current futures executor."""
     global _EXECUTOR
@@ -150,31 +222,17 @@ def add_auth_middleware(app):
     :param app: application.
     """
     auth_conf = dict(CONF.keystone_authtoken)
-    # These items should only be used for accessing Ironic API.
-    # For keystonemiddleware's authentication,
-    # keystone_authtoken's items will be used and
-    # these items will be unsupported.
-    # [ironic]/os_password
-    # [ironic]/os_username
-    # [ironic]/os_auth_url
-    # [ironic]/os_tenant_name
-    auth_conf.update({'admin_password':
-                      CONF.ironic.os_password or
-                      CONF.keystone_authtoken.admin_password,
-                      'admin_user':
-                      CONF.ironic.os_username or
-                      CONF.keystone_authtoken.admin_user,
-                      'auth_uri':
-                      CONF.ironic.os_auth_url or
-                      CONF.keystone_authtoken.auth_uri,
-                      'admin_tenant_name':
-                      CONF.ironic.os_tenant_name or
-                      CONF.keystone_authtoken.admin_tenant_name,
-                      'identity_uri':
-                      CONF.ironic.identity_uri or
-                      CONF.keystone_authtoken.identity_uri})
     auth_conf['delay_auth_decision'] = True
     app.wsgi_app = auth_token.AuthProtocol(app.wsgi_app, auth_conf)
+
+
+def add_basic_auth_middleware(app):
+    """Add HTTP Basic authentication middleware to Flask application.
+
+    :param app: application.
+    """
+    app.wsgi_app = DeferredBasicAuthMiddleware(
+        app.wsgi_app, CONF.http_basic_auth_user_file)
 
 
 def add_cors_middleware(app):
@@ -188,26 +246,24 @@ def add_cors_middleware(app):
     app.wsgi_app = cors_middleware.CORS(app.wsgi_app, CONF)
 
 
-def check_auth(request):
+def check_auth(request, rule=None, target=None):
     """Check authentication on request.
 
     :param request: Flask request
+    :param rule: policy rule to check the request against
+    :param target: dict-like structure to check rule against
     :raises: utils.Error if access is denied
     """
-    if get_auth_strategy() == 'noauth':
+    if CONF.auth_strategy not in ('keystone', 'http_basic'):
         return
-    if request.headers.get('X-Identity-Status').lower() == 'invalid':
-        raise Error(_('Authentication required'), code=401)
-    roles = (request.headers.get('X-Roles') or '').split(',')
-    if 'admin' not in roles:
-        LOG.error(_LE('Role "admin" not in user role list %s'), roles)
-        raise Error(_('Access denied'), code=403)
-
-
-def get_auth_strategy():
-    if CONF.authenticate is not None:
-        return 'keystone' if CONF.authenticate else 'noauth'
-    return CONF.auth_strategy
+    if not request.context.is_public_api:
+        if request.headers.get('X-Identity-Status', '').lower() == 'invalid':
+            raise Error(_('Authentication required'), code=401)
+    if CONF.auth_strategy != 'keystone':
+        return
+    target = {} if target is None else target
+    if not policy.authorize(rule, target, request.context.to_policy_values()):
+        raise Error(_("Access denied by policy"), code=403)
 
 
 def get_valid_macs(data):
@@ -215,9 +271,6 @@ def get_valid_macs(data):
     return [m['mac']
             for m in data.get('all_interfaces', {}).values()
             if m.get('mac')]
-
-
-_INVENTORY_MANDATORY_KEYS = ('disks', 'memory', 'cpu', 'interfaces')
 
 
 def get_inventory(data, node_info=None):
@@ -228,10 +281,15 @@ def get_inventory(data, node_info=None):
         raise Error(_('Hardware inventory is empty or missing'),
                     data=data, node_info=node_info)
 
-    for key in _INVENTORY_MANDATORY_KEYS:
-        if not inventory.get(key):
-            raise Error(_('Invalid hardware inventory: %s key is missing '
-                          'or empty') % key, data=data, node_info=node_info)
+    if not inventory.get('interfaces'):
+        raise Error(_('No network interfaces provided in the inventory'),
+                    data=data, node_info=node_info)
+
+    if not inventory.get('disks'):
+        LOG.info('No disks were detected in the inventory, assuming this '
+                 'is a disk-less node', data=data, node_info=node_info)
+        # Make sure the code iterating over it does not fail with a TypeError
+        inventory['disks'] = []
 
     return inventory
 

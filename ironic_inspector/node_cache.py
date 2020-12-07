@@ -13,50 +13,35 @@
 
 """Cache for nodes currently under introspection."""
 
+import collections
 import contextlib
 import copy
+import datetime
+import functools
 import json
-import six
-import time
+import operator
 
 from automaton import exceptions as automaton_errors
-from ironicclient import exceptions
-from oslo_concurrency import lockutils
+from openstack import exceptions as os_exc
 from oslo_config import cfg
-from oslo_db import exception as db_exc
 from oslo_db.sqlalchemy import utils as db_utils
 from oslo_utils import excutils
+from oslo_utils import reflection
+from oslo_utils import timeutils
 from oslo_utils import uuidutils
 from sqlalchemy.orm import exc as orm_errors
-from sqlalchemy import text
 
-from ironic_inspector import db
-from ironic_inspector.common.i18n import _, _LE, _LW, _LI
+from ironic_inspector.common.i18n import _
 from ironic_inspector.common import ironic as ir_utils
+from ironic_inspector.common import locking
+from ironic_inspector import db
 from ironic_inspector import introspection_state as istate
 from ironic_inspector import utils
 
 
 CONF = cfg.CONF
-
-
 LOG = utils.getProcessingLogger(__name__)
-
-
 MACS_ATTRIBUTE = 'mac'
-_LOCK_TEMPLATE = 'node-%s'
-_SEMAPHORES = lockutils.Semaphores()
-
-
-def _get_lock(uuid):
-    """Get lock object for a given node UUID."""
-    return lockutils.internal_lock(_LOCK_TEMPLATE % uuid,
-                                   semaphores=_SEMAPHORES)
-
-
-def _get_lock_ctx(uuid):
-    """Get context manager yielding a lock object for a given node UUID."""
-    return lockutils.lock(_LOCK_TEMPLATE % uuid, semaphores=_SEMAPHORES)
 
 
 class NodeInfo(object):
@@ -69,36 +54,40 @@ class NodeInfo(object):
 
     def __init__(self, uuid, version_id=None, state=None, started_at=None,
                  finished_at=None, error=None, node=None, ports=None,
-                 ironic=None, lock=None):
+                 ironic=None, manage_boot=True):
         self.uuid = uuid
-        self._version_id = version_id
-        self._state = state
         self.started_at = started_at
         self.finished_at = finished_at
         self.error = error
         self.invalidate_cache()
+        self._version_id = version_id
+        self._state = state
         self._node = node
         if ports is not None and not isinstance(ports, dict):
             ports = {p.address: p for p in ports}
         self._ports = ports
         self._attributes = None
         self._ironic = ironic
+        # On upgrade existing records will have manage_boot=NULL, which is
+        # equivalent to True actually.
+        self._manage_boot = manage_boot if manage_boot is not None else True
         # This is a lock on a node UUID, not on a NodeInfo object
-        self._lock = lock if lock is not None else _get_lock(uuid)
+        self._lock = locking.get_lock(uuid)
         # Whether lock was acquired using this NodeInfo object
-        self._locked = lock is not None
         self._fsm = None
 
     def __del__(self):
-        if self._locked:
-            LOG.warning(_LW('BUG: node lock was not released by the moment '
-                            'node info object is deleted'))
+        if self._lock.is_locked():
+            LOG.warning('BUG: node lock was not released by the moment '
+                        'node info object is deleted')
             self._lock.release()
 
     def __str__(self):
         """Self represented as an UUID and a state."""
-        return _("%(uuid)s state %(state)s") % {'uuid': self.uuid,
-                                                'state': self._state}
+        parts = [self.uuid]
+        if self._state:
+            parts += [_('state'), self._state]
+        return ' '.join(parts)
 
     def acquire_lock(self, blocking=True):
         """Acquire a lock on the associated node.
@@ -110,12 +99,13 @@ class NodeInfo(object):
                          return immediately.
         :returns: boolean value, whether lock was acquired successfully
         """
-        if self._locked:
+        if self._lock.is_locked():
+            LOG.debug('Attempting to acquire lock already held',
+                      node_info=self)
             return True
 
         LOG.debug('Attempting to acquire lock', node_info=self)
         if self._lock.acquire(blocking):
-            self._locked = True
             LOG.debug('Successfully acquired lock', node_info=self)
             return True
         else:
@@ -127,10 +117,9 @@ class NodeInfo(object):
 
         Does nothing if lock was not acquired using this NodeInfo object.
         """
-        if self._locked:
+        if self._lock.is_locked():
             LOG.debug('Successfully released lock', node_info=self)
             self._lock.release()
-        self._locked = False
 
     @property
     def version_id(self):
@@ -165,7 +154,6 @@ class NodeInfo(object):
             self._set_version_id(uuidutils.generate_uuid(), session)
             row = self._row(session)
             row.update(fields)
-            row.save(session)
 
     def commit(self):
         """Commit current node status into the database."""
@@ -199,7 +187,7 @@ class NodeInfo(object):
             yield fsm
         finally:
             if fsm.current_state != self.state:
-                LOG.info(_LI('Updating node state: %(current)s --> %(new)s'),
+                LOG.info('Updating node state: %(current)s --> %(new)s',
                          {'current': self.state, 'new': fsm.current_state},
                          node_info=self)
                 self._set_state(fsm.current_state)
@@ -208,8 +196,8 @@ class NodeInfo(object):
         """Update node_info.state based on a fsm.process_event(event) call.
 
         An AutomatonException triggers an error event.
-        If strict, node_info.finished(error=str(exc)) is called with the
-        AutomatonException instance and a EventError raised.
+        If strict, node_info.finished(istate.Events.error, error=str(exc))
+        is called with the AutomatonException instance and a EventError raised.
 
         :param event: an event to process by the fsm
         :strict: whether to fail the introspection upon an invalid event
@@ -226,8 +214,7 @@ class NodeInfo(object):
                 if strict:
                     LOG.error(msg, node_info=self)
                     # assuming an error event is always possible
-                    fsm.process_event(istate.Events.error)
-                    self.finished(error=str(exc))
+                    self.finished(istate.Events.error, error=str(exc))
                 else:
                     LOG.warning(msg, node_info=self)
                 raise utils.NodeStateInvalidEvent(str(exc), node_info=self)
@@ -248,7 +235,7 @@ class NodeInfo(object):
         if self._attributes is None:
             self._attributes = {}
             rows = db.model_query(db.Attribute).filter_by(
-                uuid=self.uuid)
+                node_uuid=self.uuid)
             for row in rows:
                 self._attributes.setdefault(row.name, []).append(row.value)
         return self._attributes
@@ -260,6 +247,11 @@ class NodeInfo(object):
             self._ironic = ir_utils.get_client()
         return self._ironic
 
+    @property
+    def manage_boot(self):
+        """Whether to manage boot for this node."""
+        return self._manage_boot
+
     def set_option(self, name, value):
         """Set an option for a node."""
         encoded = json.dumps(value)
@@ -270,22 +262,24 @@ class NodeInfo(object):
             db.Option(uuid=self.uuid, name=name, value=encoded).save(
                 session)
 
-    def finished(self, error=None):
-        """Record status for this node.
+    def finished(self, event, error=None):
+        """Record status for this node and process a terminal transition.
 
         Also deletes look up attributes from the cache.
 
+        :param event: the event to process
         :param error: error message
         """
-        self.release_lock()
 
-        self.finished_at = time.time()
+        self.release_lock()
+        self.finished_at = timeutils.utcnow()
         self.error = error
 
         with db.ensure_transaction() as session:
+            self.fsm_event(event)
             self._commit(finished_at=self.finished_at, error=self.error)
             db.model_query(db.Attribute, session=session).filter_by(
-                uuid=self.uuid).delete()
+                node_uuid=self.uuid).delete()
             db.model_query(db.Option, session=session).filter_by(
                 uuid=self.uuid).delete()
 
@@ -295,33 +289,24 @@ class NodeInfo(object):
         :param name: attribute name
         :param value: attribute value or list of possible values
         :param session: optional existing database session
-        :raises: Error if attributes values are already in database
         """
         if not isinstance(value, list):
             value = [value]
 
         with db.ensure_transaction(session) as session:
-            try:
-                for v in value:
-                    db.Attribute(name=name, value=v, uuid=self.uuid).save(
-                        session)
-            except db_exc.DBDuplicateEntry as exc:
-                LOG.error(_LE('Database integrity error %s during '
-                              'adding attributes'), exc, node_info=self)
-                raise utils.Error(_(
-                    'Some or all of %(name)s\'s %(value)s are already '
-                    'on introspection') % {'name': name, 'value': value},
-                    node_info=self)
+            for v in value:
+                db.Attribute(uuid=uuidutils.generate_uuid(), name=name,
+                             value=v, node_uuid=self.uuid).save(session)
             # Invalidate attributes so they're loaded on next usage
             self._attributes = None
 
     @classmethod
-    def from_row(cls, row, ironic=None, lock=None, node=None):
+    def from_row(cls, row, ironic=None, node=None):
         """Construct NodeInfo from a database row."""
         fields = {key: row[key]
                   for key in ('uuid', 'version_id', 'state', 'started_at',
-                              'finished_at', 'error')}
-        return cls(ironic=ironic, lock=lock, node=node, **fields)
+                              'finished_at', 'error', 'manage_boot')}
+        return cls(ironic=ironic, node=node, **fields)
 
     def invalidate_cache(self):
         """Clear all cached info, so that it's reloaded next time."""
@@ -341,19 +326,38 @@ class NodeInfo(object):
             self._node = ir_utils.get_node(self.uuid, ironic=ironic)
         return self._node
 
-    def create_ports(self, macs, ironic=None):
+    def create_ports(self, ports, ironic=None):
         """Create one or several ports for this node.
 
-        A warning is issued if port already exists on a node.
+        :param ports: List of ports with all their attributes
+                      e.g  [{'mac': xx, 'ip': xx, 'client_id': None},
+                      {'mac': xx, 'ip': None, 'client_id': None}]
+                      It also support the old style of list of macs.
+                      A warning is issued if port already exists on a node.
+
+        :param ironic: Ironic client to use instead of self.ironic
         """
         existing_macs = []
-        for mac in macs:
+        for port in ports:
+            mac = port
+            extra = {}
+            is_pxe_enabled = True
+            if isinstance(port, dict):
+                mac = port['mac']
+                client_id = port.get('client_id')
+                if client_id:
+                    extra = {'client-id': client_id}
+                if CONF.processing.update_pxe_enabled:
+                    is_pxe_enabled = port.get('pxe', True)
+
             if mac not in self.ports():
-                self._create_port(mac, ironic)
+                self._create_port(mac, ironic=ironic, extra=extra,
+                                  is_pxe_enabled=is_pxe_enabled)
             else:
                 existing_macs.append(mac)
+
         if existing_macs:
-            LOG.warning(_LW('Did not create ports %s as they already exist'),
+            LOG.warning('Did not create ports %s as they already exist',
                         existing_macs, node_info=self)
 
     def ports(self, ironic=None):
@@ -365,16 +369,22 @@ class NodeInfo(object):
         """
         if self._ports is None:
             ironic = ironic or self.ironic
-            self._ports = {p.address: p for p in
-                           ironic.node.list_ports(self.uuid, limit=0)}
+            port_list = ironic.ports(node=self.uuid, limit=None, details=True)
+            self._ports = {p.address: p for p in port_list}
         return self._ports
 
-    def _create_port(self, mac, ironic=None):
+    def _create_port(self, mac, ironic=None, **kwargs):
         ironic = ironic or self.ironic
         try:
-            port = ironic.port.create(node_uuid=self.uuid, address=mac)
-        except exceptions.Conflict:
-            LOG.warning(_LW('Port %s already exists, skipping'),
+            port = ironic.create_port(
+                node_uuid=self.uuid, address=mac, **kwargs)
+            LOG.info('Port %(uuid)s was created successfully, MAC: %(mac)s,'
+                     'attributes: %(attrs)s',
+                     {'uuid': port.id, 'mac': port.address,
+                      'attrs': kwargs},
+                     node_info=self)
+        except os_exc.ConflictException:
+            LOG.warning('Port %s already exists, skipping',
                         mac, node_info=self)
             # NOTE(dtantsur): we didn't get port object back, so we have to
             # reload ports on next access
@@ -382,14 +392,15 @@ class NodeInfo(object):
         else:
             self._ports[mac] = port
 
-    def patch(self, patches, ironic=None):
+    def patch(self, patches, ironic=None, **kwargs):
         """Apply JSON patches to a node.
 
         Refreshes cached node instance.
 
         :param patches: JSON patches to apply
         :param ironic: Ironic client to use instead of self.ironic
-        :raises: ironicclient exceptions
+        :param kwargs: Arguments to pass to ironicclient.
+        :raises: openstacksdk exceptions
         """
         ironic = ironic or self.ironic
         # NOTE(aarefiev): support path w/o ahead forward slash
@@ -399,7 +410,7 @@ class NodeInfo(object):
                 patch['path'] = '/' + patch['path']
 
         LOG.debug('Updating node with patches %s', patches, node_info=self)
-        self._node = ironic.node.update(self.uuid, patches)
+        self._node = ironic.patch_node(self.uuid, patches, **kwargs)
 
     def patch_port(self, port, patches, ironic=None):
         """Apply JSON patches to a port.
@@ -410,13 +421,13 @@ class NodeInfo(object):
         """
         ironic = ironic or self.ironic
         ports = self.ports()
-        if isinstance(port, six.string_types):
+        if isinstance(port, str):
             port = ports[port]
 
         LOG.debug('Updating port %(mac)s with patches %(patches)s',
                   {'mac': port.address, 'patches': patches},
                   node_info=self)
-        new_port = ironic.port.update(port.uuid, patches)
+        new_port = ironic.patch_port(port.id, patches)
         ports[port.address] = new_port
 
     def update_properties(self, ironic=None, **props):
@@ -443,6 +454,28 @@ class NodeInfo(object):
             ironic=ironic,
             capabilities=ir_utils.dict_to_capabilities(existing))
 
+    def add_trait(self, trait, ironic=None):
+        """Add a trait to the node.
+
+        :param trait: trait to add
+        :param ironic: Ironic client to use instead of self.ironic
+        """
+        ironic = ironic or self.ironic
+        ironic.add_node_trait(self.uuid, trait)
+
+    def remove_trait(self, trait, ironic=None):
+        """Remove a trait from the node.
+
+        :param trait: trait to add
+        :param ironic: Ironic client to use instead of self.ironic
+        """
+        ironic = ironic or self.ironic
+        try:
+            ironic.remove_node_trait(self.uuid, trait)
+        except os_exc.NotFoundException:
+            LOG.debug('Trait %s is not set, cannot remove', trait,
+                      node_info=self)
+
     def delete_port(self, port, ironic=None):
         """Delete port.
 
@@ -451,10 +484,10 @@ class NodeInfo(object):
         """
         ironic = ironic or self.ironic
         ports = self.ports()
-        if isinstance(port, six.string_types):
+        if isinstance(port, str):
             port = ports[port]
 
-        ironic.port.delete(port.uuid)
+        ironic.delete_port(port.id)
         del ports[port.address]
 
     def get_by_path(self, path):
@@ -515,7 +548,7 @@ def triggers_fsm_error_transition(errors=(Exception,),
                       error event.
     """
     def outer(func):
-        @six.wraps(func)
+        @functools.wraps(func)
         def inner(node_info, *args, **kwargs):
             ret = None
             try:
@@ -523,17 +556,19 @@ def triggers_fsm_error_transition(errors=(Exception,),
             except no_errors as exc:
                 LOG.debug('Not processing error event for the '
                           'exception: %(exc)s raised by %(func)s',
-                          {'exc': exc, 'func': func}, node_info=node_info)
+                          {'exc': exc,
+                           'func': reflection.get_callable_name(func)},
+                          node_info=node_info)
             except errors as exc:
                 with excutils.save_and_reraise_exception():
-                    LOG.error(_LE('Processing the error event because of an '
-                                  'exception %(exc_type)s: %(exc)s raised by '
-                                  '%(func)s'),
+                    LOG.error('Processing the error event because of an '
+                              'exception %(exc_type)s: %(exc)s raised by '
+                              '%(func)s',
                               {'exc_type': type(exc), 'exc': exc,
-                               'func': func},
+                               'func': reflection.get_callable_name(func)},
                               node_info=node_info)
                     # an error event should be possible from all states
-                    node_info.fsm_event(istate.Events.error)
+                    node_info.finished(istate.Events.error, error=str(exc))
             return ret
         return inner
     return outer
@@ -549,16 +584,12 @@ def fsm_event_before(event, strict=False):
     :param strict: make an invalid fsm event trigger an error event
     """
     def outer(func):
-        @six.wraps(func)
+        @functools.wraps(func)
         def inner(node_info, *args, **kwargs):
             LOG.debug('Processing event %(event)s before calling '
                       '%(func)s', {'event': event, 'func': func},
                       node_info=node_info)
             node_info.fsm_event(event, strict=strict)
-            LOG.debug('Calling: %(func)s(<node>, *%(args_)s, '
-                      '**%(kwargs_)s)', {'func': func, 'args_': args,
-                                         'kwargs_': kwargs},
-                      node_info=node_info)
             return func(node_info, *args, **kwargs)
         return inner
     return outer
@@ -574,12 +605,8 @@ def fsm_event_after(event, strict=False):
     :param strict: make an invalid fsm event trigger an error event
     """
     def outer(func):
-        @six.wraps(func)
+        @functools.wraps(func)
         def inner(node_info, *args, **kwargs):
-            LOG.debug('Calling: %(func)s(<node>, *%(args_)s, '
-                      '**%(kwargs_)s)', {'func': func, 'args_': args,
-                                         'kwargs_': kwargs},
-                      node_info=node_info)
             ret = func(node_info, *args, **kwargs)
             LOG.debug('Processing event %(event)s after calling '
                       '%(func)s', {'event': event, 'func': func},
@@ -617,14 +644,14 @@ def release_lock(func):
     instance.
 
     """
-    @six.wraps(func)
+    @functools.wraps(func)
     def inner(node_info, *args, **kwargs):
         try:
             return func(node_info, *args, **kwargs)
         finally:
             # FIXME(milan) hacking the test cases to work
             # with release_lock.assert_called_once...
-            if node_info._locked:
+            if node_info._lock.is_locked():
                 node_info.release_lock()
     return inner
 
@@ -659,7 +686,7 @@ def start_introspection(uuid, **kwargs):
         return add_node(uuid, state, **kwargs)
 
 
-def add_node(uuid, state, **attributes):
+def add_node(uuid, state, manage_boot=True, **attributes):
     """Store information about a node under introspection.
 
     All existing information about this node is dropped.
@@ -667,16 +694,20 @@ def add_node(uuid, state, **attributes):
 
     :param uuid: Ironic node UUID
     :param state: The initial state of the node
+    :param manage_boot: whether to manage boot for this node
     :param attributes: attributes known about this node (like macs, BMC etc);
                        also ironic client instance may be passed under 'ironic'
     :returns: NodeInfo
     """
-    started_at = time.time()
+    started_at = timeutils.utcnow()
     with db.ensure_transaction() as session:
         _delete_node(uuid)
-        db.Node(uuid=uuid, state=state, started_at=started_at).save(session)
+        version_id = uuidutils.generate_uuid()
+        db.Node(uuid=uuid, state=state, version_id=version_id,
+                started_at=started_at, manage_boot=manage_boot).save(session)
 
         node_info = NodeInfo(uuid=uuid, state=state, started_at=started_at,
+                             version_id=version_id, manage_boot=manage_boot,
                              ironic=attributes.pop('ironic', None))
         for (name, value) in attributes.items():
             if not value:
@@ -693,10 +724,9 @@ def delete_nodes_not_in_list(uuids):
     """
     inspector_uuids = _list_node_uuids()
     for uuid in inspector_uuids - uuids:
-        LOG.warning(
-            _LW('Node %s was deleted from Ironic, dropping from Ironic '
-                'Inspector database'), uuid)
-        with _get_lock_ctx(uuid):
+        LOG.warning('Node %s was deleted from Ironic, dropping from Ironic '
+                    'Inspector database', uuid)
+        with locking.get_lock(uuid):
             _delete_node(uuid)
 
 
@@ -707,7 +737,9 @@ def _delete_node(uuid, session=None):
     :param session: optional existing database session
     """
     with db.ensure_transaction(session) as session:
-        for model in (db.Attribute, db.Option, db.Node):
+        db.model_query(db.Attribute, session=session).filter_by(
+            node_uuid=uuid).delete()
+        for model in (db.Option, db.IntrospectionData, db.Node):
             db.model_query(model,
                            session=session).filter_by(uuid=uuid).delete()
 
@@ -721,8 +753,9 @@ def introspection_active():
 
 def active_macs():
     """List all MAC's that are on introspection right now."""
-    return ({x.value for x in db.model_query(db.Attribute.value).
-            filter_by(name=MACS_ATTRIBUTE)})
+    query = (db.model_query(db.Attribute.value).join(db.Node)
+             .filter(db.Attribute.name == MACS_ATTRIBUTE))
+    return {x.value for x in query}
 
 
 def _list_node_uuids():
@@ -733,12 +766,11 @@ def _list_node_uuids():
     return {x.uuid for x in db.model_query(db.Node.uuid)}
 
 
-def get_node(node_id, ironic=None, locked=False):
+def get_node(node_id, ironic=None):
     """Get node from cache.
 
     :param node_id: node UUID or name.
     :param ironic: optional ironic client instance
-    :param locked: if True, get a lock on node before fetching its data
     :returns: structure NodeInfo.
     """
     if uuidutils.is_uuid_like(node_id):
@@ -746,39 +778,29 @@ def get_node(node_id, ironic=None, locked=False):
         uuid = node_id
     else:
         node = ir_utils.get_node(node_id, ironic=ironic)
-        uuid = node.uuid
+        uuid = node.id
 
-    if locked:
-        lock = _get_lock(uuid)
-        lock.acquire()
-    else:
-        lock = None
-
-    try:
-        row = db.model_query(db.Node).filter_by(uuid=uuid).first()
-        if row is None:
-            raise utils.Error(_('Could not find node %s in cache') % uuid,
-                              code=404)
-        return NodeInfo.from_row(row, ironic=ironic, lock=lock, node=node)
-    except Exception:
-        with excutils.save_and_reraise_exception():
-            if lock is not None:
-                lock.release()
+    row = db.model_query(db.Node).filter_by(uuid=uuid).first()
+    if row is None:
+        raise utils.Error(_('Could not find node %s in cache') % uuid,
+                          code=404)
+    return NodeInfo.from_row(row, ironic=ironic, node=node)
 
 
 def find_node(**attributes):
     """Find node in cache.
 
+    Looks up a node based on attributes in a best-match fashion.
     This function acquires a lock on a node.
 
     :param attributes: attributes known about this node (like macs, BMC etc)
                        also ironic client instance may be passed under 'ironic'
     :returns: structure NodeInfo with attributes ``uuid`` and ``created_at``
-    :raises: Error if node is not found
+    :raises: Error if node is not found or multiple nodes match the attributes
     """
     ironic = attributes.pop('ironic', None)
     # NOTE(dtantsur): sorting is not required, but gives us predictability
-    found = set()
+    found = collections.Counter()
 
     for (name, value) in sorted(attributes.items()):
         if not value:
@@ -789,24 +811,31 @@ def find_node(**attributes):
 
         LOG.debug('Trying to use %s of value %s for node look up',
                   name, value)
-        value_list = []
-        for v in value:
-            value_list.append("name='%s' AND value='%s'" % (name, v))
-        stmt = ('select distinct uuid from attributes where ' +
-                ' OR '.join(value_list))
-        rows = (db.model_query(db.Attribute.uuid).from_statement(
-            text(stmt)).all())
-        if rows:
-            found.update(item.uuid for item in rows)
+        query = db.model_query(db.Attribute.node_uuid)
+        pairs = [(db.Attribute.name == name) &
+                 (db.Attribute.value == v) for v in value]
+        query = query.filter(functools.reduce(operator.or_, pairs))
+        found.update(row.node_uuid for row in query.distinct().all())
 
     if not found:
         raise utils.NotFoundInCacheError(_(
             'Could not find a node for attributes %s') % attributes)
-    elif len(found) > 1:
+
+    most_common = found.most_common()
+    LOG.debug('The following nodes match the attributes: %(attributes)s, '
+              'scoring: %(most_common)s',
+              {'most_common': ', '.join('%s: %d' % tpl for tpl in most_common),
+               'attributes': ', '.join('%s=%s' % tpl for tpl in
+                                       attributes.items())})
+
+    # NOTE(milan) most_common is sorted, higher scores first
+    highest_score = most_common[0][1]
+    found = [item[0] for item in most_common if highest_score == item[1]]
+    if len(found) > 1:
         raise utils.Error(_(
-            'Multiple matching nodes found for attributes '
+            'Multiple nodes match the same number of attributes '
             '%(attr)s: %(found)s')
-            % {'attr': attributes, 'found': list(found)}, code=404)
+            % {'attr': attributes, 'found': found}, code=404)
 
     uuid = found.pop()
     node_info = NodeInfo(uuid=uuid, ironic=ironic)
@@ -836,47 +865,45 @@ def find_node(**attributes):
 def clean_up():
     """Clean up the cache.
 
-    * Finish introspection for timed out nodes.
-    * Drop outdated node status information.
+    Finish introspection for timed out nodes.
 
     :return: list of timed out node UUID's
     """
-    status_keep_threshold = (time.time() -
-                             CONF.node_status_keep_time)
+    timeout = CONF.timeout
+    if timeout <= 0:
+        return []
+    threshold = timeutils.utcnow() - datetime.timedelta(seconds=timeout)
+    uuids = [row.uuid for row in
+             db.model_query(db.Node.uuid).filter(
+                 db.Node.started_at < threshold,
+                 db.Node.finished_at.is_(None)).all()]
 
-    with db.ensure_transaction() as session:
-        db.model_query(db.Node, session=session).filter(
-            db.Node.finished_at.isnot(None),
-            db.Node.finished_at < status_keep_threshold).delete()
+    if not uuids:
+        return []
 
-        timeout = CONF.timeout
-        if timeout <= 0:
-            return []
-        threshold = time.time() - timeout
-        uuids = [row.uuid for row in
-                 db.model_query(db.Node.uuid, session=session).filter(
-                     db.Node.started_at < threshold,
-                     db.Node.finished_at.is_(None)).all()]
-        if not uuids:
-            return []
-
-        LOG.error(_LE('Introspection for nodes %s has timed out'), uuids)
-        for u in uuids:
-            node_info = get_node(u, locked=True)
+    LOG.error('Introspection for nodes %s has timed out', uuids)
+    locked_uuids = []
+    for u in uuids:
+        node_info = get_node(u)
+        if node_info.acquire_lock(blocking=False):
             try:
                 if node_info.finished_at or node_info.started_at > threshold:
                     continue
-                node_info.fsm_event(istate.Events.timeout)
-                node_info.finished(error='Introspection timeout')
-
-                db.model_query(db.Attribute, session=session).filter_by(
-                    uuid=u).delete()
-                db.model_query(db.Option, session=session).filter_by(
-                    uuid=u).delete()
+                if node_info.state != istate.States.waiting:
+                    LOG.error('Something went wrong, timeout occurred '
+                              'while introspection in "%s" state',
+                              node_info.state,
+                              node_info=node_info)
+                node_info.finished(
+                    istate.Events.timeout, error='Introspection timeout')
+                locked_uuids.append(u)
             finally:
                 node_info.release_lock()
+        else:
+            LOG.info('Failed to acquire lock when updating node state',
+                     node_info=node_info)
 
-    return uuids
+    return locked_uuids
 
 
 def create_node(driver, ironic=None, **attributes):
@@ -887,7 +914,7 @@ def create_node(driver, ironic=None, **attributes):
     * Sets node_info state to enrolling.
 
     :param driver: driver for Ironic node.
-    :param ironic: ronic client instance.
+    :param ironic: ironic client instance.
     :param attributes: dict, additional keyword arguments to pass
                              to the ironic client on node creation.
     :return: NodeInfo, or None in case error happened.
@@ -895,12 +922,49 @@ def create_node(driver, ironic=None, **attributes):
     if ironic is None:
         ironic = ir_utils.get_client()
     try:
-        node = ironic.node.create(driver=driver, **attributes)
-    except exceptions.InvalidAttribute as e:
-        LOG.error(_LE('Failed to create new node: %s'), e)
+        node = ironic.create_node(driver=driver, **attributes)
+    except os_exc.SDKException as e:
+        LOG.error('Failed to create new node: %s', e)
     else:
-        LOG.info(_LI('Node %s was created successfully'), node.uuid)
-        return add_node(node.uuid, istate.States.enrolling, ironic=ironic)
+        LOG.info('Node %s was created successfully', node.id)
+        return add_node(node.id, istate.States.enrolling, ironic=ironic)
+
+
+def record_node(ironic=None, bmc_addresses=None, macs=None):
+    """Create a cache record for a known active node.
+
+    :param ironic: ironic client instance.
+    :param bmc_addresses: list of BMC addresses.
+    :param macs: list of MAC addresses.
+    :return: NodeInfo
+    """
+    if not bmc_addresses and not macs:
+        raise utils.NotFoundInCacheError(
+            _("Existing node cannot be found since neither MAC addresses "
+              "nor BMC addresses are present in the inventory"))
+
+    if ironic is None:
+        ironic = ir_utils.get_client()
+
+    node = ir_utils.lookup_node(macs=macs, bmc_addresses=bmc_addresses,
+                                ironic=ironic)
+    if not node:
+        bmc_addresses = ', '.join(bmc_addresses) if bmc_addresses else None
+        macs = ', '.join(macs) if macs else None
+        raise utils.NotFoundInCacheError(
+            _("Existing node was not found by MAC address(es) %(macs)s "
+              "and BMC address(es) %(addr)s") %
+            {'macs': macs, 'addr': bmc_addresses})
+
+    node = ironic.get_node(node, fields=['uuid', 'provision_state'])
+    # TODO(dtantsur): do we want to allow updates in all states?
+    if node.provision_state not in ir_utils.VALID_ACTIVE_STATES:
+        raise utils.Error(_("Node %(node)s is not active, its provision "
+                            "state is %(state)s") %
+                          {'node': node.id, 'state': node.provision_state})
+
+    return add_node(node.id, istate.States.waiting,
+                    manage_boot=False, mac=macs, bmc_address=bmc_addresses)
 
 
 def get_node_list(ironic=None, marker=None, limit=None):
@@ -927,3 +991,44 @@ def get_node_list(ironic=None, marker=None, limit=None):
                                    ('started_at', 'uuid'),
                                    marker=marker, sort_dir='desc')
     return [NodeInfo.from_row(row, ironic=ironic) for row in rows]
+
+
+def store_introspection_data(node_id, introspection_data, processed=True):
+    """Store introspection data for this node.
+
+    :param node_id: node UUID.
+    :param introspection_data: A dictionary of introspection data
+    :param processed: Specify the type of introspected data, set to False
+                      indicates the data is unprocessed.
+    """
+    with db.ensure_transaction() as session:
+        record = db.model_query(db.IntrospectionData,
+                                session=session).filter_by(
+            uuid=node_id, processed=processed).first()
+        if record is None:
+            row = db.IntrospectionData()
+            row.update({'uuid': node_id, 'processed': processed,
+                        'data': introspection_data})
+            session.add(row)
+        else:
+            record.update({'data': introspection_data})
+        session.flush()
+
+
+def get_introspection_data(node_id, processed=True):
+    """Get introspection data for this node.
+
+    :param node_id: node UUID.
+    :param processed: Specify the type of introspected data, set to False
+                      indicates retrieving the unprocessed data.
+    :return: A dictionary representation of intropsected data
+    """
+    try:
+        ref = db.model_query(db.IntrospectionData).filter_by(
+            uuid=node_id, processed=processed).one()
+        return ref['data']
+    except orm_errors.NoResultFound:
+        msg = _('Introspection data not found for node %(node)s, '
+                'processed=%(processed)s') % {'node': node_id,
+                                              'processed': processed}
+        raise utils.IntrospectionDataNotFound(msg)

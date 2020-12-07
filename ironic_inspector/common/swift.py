@@ -15,10 +15,9 @@
 
 import json
 
+import openstack
+from openstack import exceptions as os_exc
 from oslo_config import cfg
-import six
-from swiftclient import client as swift_client
-from swiftclient import exceptions as swift_exceptions
 
 from ironic_inspector.common.i18n import _
 from ironic_inspector.common import keystone
@@ -27,70 +26,8 @@ from ironic_inspector import utils
 CONF = cfg.CONF
 
 
-SWIFT_GROUP = 'swift'
-SWIFT_OPTS = [
-    cfg.IntOpt('max_retries',
-               default=2,
-               help=_('Maximum number of times to retry a Swift request, '
-                      'before failing.')),
-    cfg.IntOpt('delete_after',
-               default=0,
-               help=_('Number of seconds that the Swift object will last '
-                      'before being deleted. (set to 0 to never delete the '
-                      'object).')),
-    cfg.StrOpt('container',
-               default='ironic-inspector',
-               help=_('Default Swift container to use when creating '
-                      'objects.')),
-    cfg.StrOpt('os_auth_version',
-               default='2',
-               help=_('Keystone authentication API version'),
-               deprecated_for_removal=True,
-               deprecated_reason=_('Use options presented by configured '
-                                   'keystone auth plugin.')),
-    cfg.StrOpt('os_auth_url',
-               default='',
-               help=_('Keystone authentication URL'),
-               deprecated_for_removal=True,
-               deprecated_reason=_('Use options presented by configured '
-                                   'keystone auth plugin.')),
-    cfg.StrOpt('os_service_type',
-               default='object-store',
-               help=_('Swift service type.')),
-    cfg.StrOpt('os_endpoint_type',
-               default='internalURL',
-               help=_('Swift endpoint type.')),
-    cfg.StrOpt('os_region',
-               help=_('Keystone region to get endpoint for.')),
-]
-
-# NOTE(pas-ha) these old options conflict with options exported by
-# most used keystone auth plugins. Need to register them manually
-# for the backward-compat case.
-LEGACY_OPTS = [
-    cfg.StrOpt('username',
-               default='',
-               help=_('User name for accessing Swift API.')),
-    cfg.StrOpt('password',
-               default='',
-               help=_('Password for accessing Swift API.'),
-               secret=True),
-    cfg.StrOpt('tenant_name',
-               default='',
-               help=_('Tenant name for accessing Swift API.')),
-]
-
-CONF.register_opts(SWIFT_OPTS, group=SWIFT_GROUP)
-keystone.register_auth_opts(SWIFT_GROUP)
-
 OBJECT_NAME_PREFIX = 'inspector_data'
 SWIFT_SESSION = None
-LEGACY_MAP = {
-    'auth_url': 'os_auth_url',
-    'username': 'username',
-    'password': 'password',
-    'tenant_name': 'tenant_name',
-}
 
 
 def reset_swift_session():
@@ -111,49 +48,33 @@ class SwiftAPI(object):
         Authentification is loaded from config file.
         """
         global SWIFT_SESSION
-        if not SWIFT_SESSION:
-            SWIFT_SESSION = keystone.get_session(
-                SWIFT_GROUP, legacy_mapping=LEGACY_MAP,
-                legacy_auth_opts=LEGACY_OPTS)
-        # TODO(pas-ha): swiftclient does not support keystone sessions ATM.
-        # Must be reworked when LP bug #1518938 is fixed.
-        swift_url = SWIFT_SESSION.get_endpoint(
-            service_type=CONF.swift.os_service_type,
-            endpoint_type=CONF.swift.os_endpoint_type,
-            region_name=CONF.swift.os_region
-        )
-        token = SWIFT_SESSION.get_token()
-        params = dict(retries=CONF.swift.max_retries,
-                      preauthurl=swift_url,
-                      preauthtoken=token)
-        # NOTE(pas-ha):session.verify is for HTTPS urls and can be
-        # - False (do not verify)
-        # - True (verify but try to locate system CA certificates)
-        # - Path (verify using specific CA certificate)
-        # This is normally handled inside the Session instance,
-        # but swiftclient still does not support sessions,
-        # so we need to reconstruct these options from Session here.
-        verify = SWIFT_SESSION.verify
-        params['insecure'] = not verify
-        if verify and isinstance(verify, six.string_types):
-            params['cacert'] = verify
 
-        self.connection = swift_client.Connection(**params)
+        try:
+            if not SWIFT_SESSION:
+                SWIFT_SESSION = keystone.get_session('swift')
 
-    def create_object(self, object, data, container=CONF.swift.container,
-                      headers=None):
+            self.connection = openstack.connection.Connection(
+                session=SWIFT_SESSION,
+                oslo_conf=CONF).object_store
+        except Exception as exc:
+            raise utils.Error(_("Could not connect to the object storage "
+                                "service: %s") % exc)
+
+    def create_object(self, object, data, container=None, headers=None):
         """Uploads a given string to Swift.
 
         :param object: The name of the object in Swift
         :param data: string data to put in the object
         :param container: The name of the container for the object.
+            Defaults to the value set in the configuration options.
         :param headers: the headers for the object to pass to Swift
         :returns: The Swift UUID of the object
         :raises: utils.Error, if any operation with Swift fails.
         """
+        container = container or CONF.swift.container
         try:
-            self.connection.put_container(container)
-        except swift_exceptions.ClientException as e:
+            self.connection.create_container(container)
+        except os_exc.SDKException as e:
             err_msg = (_('Swift failed to create container %(container)s. '
                          'Error was: %(error)s') %
                        {'container': container, 'error': e})
@@ -164,11 +85,9 @@ class SwiftAPI(object):
             headers['X-Delete-After'] = CONF.swift.delete_after
 
         try:
-            obj_uuid = self.connection.put_object(container,
-                                                  object,
-                                                  data,
-                                                  headers=headers)
-        except swift_exceptions.ClientException as e:
+            obj_uuid = self.connection.create_object(
+                container, object, data=data, headers=headers)
+        except os_exc.SDKException as e:
             err_msg = (_('Swift failed to create object %(object)s in '
                          'container %(container)s. Error was: %(error)s') %
                        {'object': object, 'container': container, 'error': e})
@@ -176,17 +95,19 @@ class SwiftAPI(object):
 
         return obj_uuid
 
-    def get_object(self, object, container=CONF.swift.container):
+    def get_object(self, object, container=None):
         """Downloads a given object from Swift.
 
         :param object: The name of the object in Swift
         :param container: The name of the container for the object.
+            Defaults to the value set in the configuration options.
         :returns: Swift object
         :raises: utils.Error, if the Swift operation fails.
         """
+        container = container or CONF.swift.container
         try:
-            headers, obj = self.connection.get_object(container, object)
-        except swift_exceptions.ClientException as e:
+            obj = self.connection.download_object(object, container=container)
+        except os_exc.SDKException as e:
             err_msg = (_('Swift failed to get object %(object)s in '
                          'container %(container)s. Error was: %(error)s') %
                        {'object': object, 'container': container, 'error': e})
@@ -225,7 +146,3 @@ def get_introspection_data(uuid, suffix=None):
     if suffix is not None:
         swift_object_name = '%s-%s' % (swift_object_name, suffix)
     return swift_api.get_object(swift_object_name)
-
-
-def list_opts():
-    return keystone.add_auth_options(SWIFT_OPTS, SWIFT_GROUP)

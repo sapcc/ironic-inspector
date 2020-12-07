@@ -20,12 +20,12 @@ Basics
   ``VERSION`` is the current stable series. E.g. at the moment of writing the
   stable branch is ``stable/1.0``.
 
-* Please file a launchpad_ blueprint for any significant code change and a bug
-  for any significant bug fix.
+* Please file an RFE in StoryBoard_ for any significant code change and a
+  regular story for any significant bug fix.
 
 .. _OpenStack GitHub: https://github.com/openstack/ironic-inspector
-.. _Gerrit Workflow: http://docs.openstack.org/infra/manual/developers.html#development-workflow
-.. _launchpad: https://bugs.launchpad.net/ironic-inspector
+.. _Gerrit Workflow: https://docs.openstack.org/infra/manual/developers.html#development-workflow
+.. _StoryBoard: https://storyboard.openstack.org/#!/project/944
 
 Development Environment
 ~~~~~~~~~~~~~~~~~~~~~~~
@@ -41,22 +41,20 @@ Next checkout and create environments::
     tox
 
 Repeat *tox* command each time you need to run tests. If you don't have Python
-interpreter of one of supported versions (currently 2.7 and 3.4), use
+interpreter of one of supported versions (currently 3.6 and 3.7), use
 ``-e`` flag to select only some environments, e.g.
 
 ::
 
-    tox -e py27
-
-.. note::
-    Support for Python 3 is highly experimental, stay with Python 2 for the
-    production environment for now.
+    tox -e py36
 
 .. note::
     This command also runs tests for database migrations. By default the sqlite
     backend is used. For testing with mysql or postgresql, you need to set up
     a db named 'openstack_citest' with user 'openstack_citest' and password
-    'openstack_citest' on localhost.
+    'openstack_citest' on localhost. Use the script
+    ``tools/test_setup.sh`` to set the database up the same way as
+    done in the OpenStack CI environment.
 
 .. note::
     Users of Fedora <= 23 will need to run "sudo dnf --releasever=24 update
@@ -66,27 +64,47 @@ To run the functional tests, use::
 
     tox -e func
 
+Once you have added new state or transition into inspection state machine, you
+should regenerate :ref:`State machine diagram <state_machine_diagram>` with::
+
+    tox -e genstates
+
 Run the service with::
 
-    .tox/py27/bin/ironic-inspector --config-file example.conf
+    .tox/py36/bin/ironic-inspector --config-file example.conf
 
 Of course you may have to modify ``example.conf`` to match your OpenStack
-environment.
+environment. See the `install guide <../install#sample-configuration-files>`_
+for information on generating or downloading an example configuration file.
 
 You can develop and test **ironic-inspector** using DevStack - see
-`DevStack Support`_ for the current status.
+`Deploying Ironic Inspector with DevStack`_ for the current status.
 
-DevStack Support
-~~~~~~~~~~~~~~~~
+Deploying Ironic Inspector with DevStack
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-`DevStack <http://docs.openstack.org/developer/devstack/>`_ provides a way to
-quickly build full OpenStack development environment with requested
-components. There is a plugin for installing **ironic-inspector** on DevStack.
+`DevStack <https://docs.openstack.org/devstack/latest/>`_ provides a way to
+quickly build a full OpenStack development environment with requested
+components. There is a plugin for installing **ironic-inspector** in DevStack.
+Installing **ironic-inspector** requires a machine running Ubuntu 14.04 (or
+later) or Fedora 23 (or later). Make sure this machine is fully up to date and
+has the latest packages installed before beginning this process.
+
+Download DevStack::
+
+    git clone https://git.openstack.org/openstack-dev/devstack.git
+    cd devstack
+
+
+Create ``local.conf`` file with minimal settings required to
+enable both the **ironic** and the **ironic-inspector**. You can start with the
+`Example local.conf`_ and extend it as needed.
+
 
 Example local.conf
 ------------------
 
-.. literalinclude:: ../../devstack/example.local.conf
+.. literalinclude:: ../../../devstack/example.local.conf
 
 
 Notes
@@ -102,20 +120,57 @@ Notes
 * Network configuration is pretty sensitive, better not to touch it
   without deep understanding.
 
-* This configuration disables Heat and Cinder, adjust it if you need these
-  services.
+* This configuration disables **horizon**, **heat**, **cinder** and
+  **tempest**, adjust it if you need these services.
+
+Start the install::
+
+    ./stack.sh
 
 Usage
 -----
 
-Start introspection for a node manually::
+After installation is complete, you can source ``openrc`` in your shell, and
+then use the OpenStack CLI to manage your DevStack::
 
-    source devstack/openrc admin admin
-    openstack baremetal introspection start <UUID>
+    source openrc admin demo
 
-Then check status via API::
+Show DevStack screens::
 
-    openstack baremetal introspection status <UUID>
+    screen -x stack
+
+To exit screen, hit ``CTRL-a d``.
+
+List baremetal nodes::
+
+    baremetal node list
+
+Bring the node to manageable state::
+
+    baremetal node manage <NodeID>
+
+Inspect the node::
+
+    baremetal node inspect <NodeID>
+
+.. note::
+    The deploy driver used must support the inspect interface. See also the
+    `Ironic Python Agent
+    <https://docs.openstack.org/ironic/latest/admin/drivers/ipa.html>`_.
+
+A node can also be inspected using the following command. However, this will
+not affect the provision state of the node::
+
+    baremetal introspection start <NodeID>
+
+Check inspection status::
+
+    baremetal introspection status <NodeID>
+
+Optionally, get the inspection data::
+
+    baremetal introspection data save <NodeID>
+
 
 Writing a Plugin
 ~~~~~~~~~~~~~~~~
@@ -133,6 +188,12 @@ Writing a Plugin
       called after node is found and ports are created, but before data is
       updated on a node.  Please refer to the docstring for details
       and examples.
+
+  You can optionally define the following attribute:
+
+  ``dependencies``
+      a list of entry point names of the hooks this hook depends on. These
+      hooks are expected to be enabled before the current hook.
 
   Make your plugin a setuptools entry point under
   ``ironic_inspector.hooks.processing`` namespace and enable it in the
@@ -203,8 +264,8 @@ Writing a Plugin
     ``**`` argument is needed so that we can add optional arguments without
     breaking out-of-tree plugins. Please make sure to include and ignore it.
 
-.. _ironic_inspector.plugins.base: http://docs.openstack.org/developer/ironic-inspector/api/ironic_inspector.plugins.base.html
-.. _Introspection Rules: http://docs.openstack.org/developer/ironic-inspector/usage.html#introspection-rules
+.. _ironic_inspector.plugins.base: https://docs.openstack.org/ironic-inspector/latest/contributor/api/ironic_inspector.plugins.base.html
+.. _Introspection Rules: https://docs.openstack.org/ironic-inspector/latest/user/usage.html#introspection-rules
 
 Making changes to the database
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -214,16 +275,12 @@ database models found in ironic_inspector.db_ and then create a migration to
 reflect that change.
 
 There are two ways to create a migration which are described below, both of
-these generate a new migration file. In this file there are two functions:
+these generate a new migration file. In this file there is only one function:
 
-* upgrade - The upgrade function is run when
+* ``upgrade`` - The function to run when
     ``ironic-inspector-dbsync upgrade`` is run, and should be populated with
     code to bring the database up to its new state from the state it was in
     after the last migration.
-
-* downgrade - The downgrade function should have code to undo the actions which
-    upgrade performs, returning the database to the state it would have been in
-    before the migration ran.
 
 For further information on creating a migration, refer to
 `Create a Migration Script`_ from the alembic documentation.
@@ -247,12 +304,60 @@ Manual
 ------
 
 This will generate an empty migration file, with the correct revision
-information already included. However upgrade and downgrade are left empty and
-must be manually populated in order to perform the correct actions on the
-database::
+information already included. However the upgrade function is left empty
+and must be manually populated in order to perform the correct actions on
+the database::
 
     ironic-inspector-dbsync revision -m "A short description"
 
-.. _Create a Migration Script: https://alembic.readthedocs.org/en/latest/tutorial.html#create-a-migration-script
-.. _ironic_inspector.db: http://docs.openstack.org/developer/ironic-inspector/api/ironic_inspector.db.html
-.. _What does Autogenerate Detect (and what does it not detect?): http://alembic.readthedocs.org/en/latest/autogenerate.html#what-does-autogenerate-detect-and-what-does-it-not-detect
+.. _Create a Migration Script: http://alembic.zzzcomputing.com/en/latest/tutorial.html#create-a-migration-script
+.. _ironic_inspector.db: https://docs.openstack.org/ironic-inspector/latest/contributor/api/ironic_inspector.db.html
+.. _What does Autogenerate Detect (and what does it not detect?): http://alembic.zzzcomputing.com/en/latest/autogenerate.html#what-does-autogenerate-detect-and-what-does-it-not-detect
+
+Implementing PXE Filter Drivers
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Background
+----------
+
+**inspector** in-band introspection PXE-boots the Ironic Python Agent "live"
+image, to inspect the baremetal server. **ironic** also PXE-boots IPA to
+perform tasks on a node, such as deploying an image. **ironic** uses
+**neutron** to provide DHCP, however **neutron** does not provide DHCP for
+unknown MAC addresses so **inspector** has to use its own DHCP/TFTP stack for
+discovery and inspection.
+
+When **ironic** and **inspector** are operating in the same L2 network, there
+is a potential for the two DHCPs to race, which could result in a node being
+deployed by **ironic** being PXE booted by **inspector**.
+
+To prevent DHCP races between the **inspector** DHCP and **ironic** DHCP,
+**inspector** has to be able to filter which nodes can get a DHCP lease from
+the **inspector** DHCP server. These filters can then be used to prevent
+node's enrolled in **ironic** inventory from being PXE-booted unless they are
+explicitly moved into the ``inspected`` state.
+
+Filter Interface
+----------------
+
+.. py:currentmodule:: ironic_inspector.pxe_filter.interface
+
+The contract between **inspector** and a PXE filter driver is described in the
+:class:`FilterDriver` interface. The methods a driver has to implement are:
+
+* :meth:`~FilterDriver.init_filter` called on the service start to initialize
+  internal driver state
+
+* :meth:`~FilterDriver.sync` called both periodically and when a node starts or
+  finishes introspection to allow or deny its ports MAC addresses in the driver
+
+* :meth:`~FilterDriver.tear_down_filter` called on service exit to reset the
+  internal driver state
+
+.. py:currentmodule:: ironic_inspector.pxe_filter.base
+
+The driver-specific configuration is suggested to be parsed during
+instantiation. There's also a convenience generic interface implementation
+:class:`BaseFilter` that provides base locking and initialization
+implementation. If required, a driver can opt-out from the periodic
+synchronization by overriding the :meth:`~BaseFilter.get_periodic_sync_task`.

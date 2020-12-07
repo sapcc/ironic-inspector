@@ -19,10 +19,9 @@ import jsonschema
 from oslo_db import exception as db_exc
 from oslo_utils import timeutils
 from oslo_utils import uuidutils
-import six
 from sqlalchemy import orm
 
-from ironic_inspector.common.i18n import _, _LE, _LI
+from ironic_inspector.common.i18n import _
 from ironic_inspector import db
 from ironic_inspector.plugins import base as plugins_base
 from ironic_inspector import utils
@@ -102,17 +101,19 @@ def actions_schema():
 class IntrospectionRule(object):
     """High-level class representing an introspection rule."""
 
-    def __init__(self, uuid, conditions, actions, description):
+    def __init__(self, uuid, conditions, actions, description, scope=None):
         """Create rule object from database data."""
         self._uuid = uuid
         self._conditions = conditions
         self._actions = actions
         self._description = description
+        self._scope = scope
 
     def as_dict(self, short=False):
         result = {
             'uuid': self._uuid,
             'description': self._description,
+            'scope': self._scope
         }
 
         if not short:
@@ -153,9 +154,9 @@ class IntrospectionRule(object):
                               cond.field, node_info=node_info, data=data)
                     field_values = [None]
                 else:
-                    LOG.info(_LI('Field with JSON path %(path)s was not found '
-                                 'in data, rule "%(rule)s" will not '
-                                 'be applied'),
+                    LOG.info('Field with JSON path %(path)s was not found '
+                             'in data, rule "%(rule)s" will not '
+                             'be applied',
                              {'path': cond.field, 'rule': self.description},
                              node_info=node_info, data=data)
                     return False
@@ -171,60 +172,98 @@ class IntrospectionRule(object):
                     break
 
             if not result:
-                LOG.info(_LI('Rule "%(rule)s" will not be applied: condition '
-                             '%(field)s %(op)s %(params)s failed'),
+                LOG.info('Rule "%(rule)s" will not be applied: condition '
+                         '%(field)s %(op)s %(params)s failed',
                          {'rule': self.description, 'field': cond.field,
                           'op': cond.op, 'params': cond.params},
                          node_info=node_info, data=data)
                 return False
 
-        LOG.info(_LI('Rule "%s" will be applied'), self.description,
+        LOG.info('Rule "%s" will be applied', self.description,
                  node_info=node_info, data=data)
         return True
 
-    def apply_actions(self, node_info, rollback=False, data=None):
+    def apply_actions(self, node_info, data=None):
         """Run actions on a node.
 
         :param node_info: NodeInfo instance
-        :param rollback: if True, rollback actions are executed
         :param data: introspection data
         """
-        if rollback:
-            method = 'rollback'
-        else:
-            method = 'apply'
-
-        LOG.debug('Running %(what)s actions for rule "%(rule)s"',
-                  {'what': method, 'rule': self.description},
+        LOG.debug('Running actions for rule "%s"', self.description,
                   node_info=node_info, data=data)
 
         ext_mgr = plugins_base.rule_actions_manager()
         for act in self._actions:
             ext = ext_mgr[act.action].obj
+
             for formatted_param in ext.FORMATTED_PARAMS:
-                value = act.params.get(formatted_param)
-                if not value or not isinstance(value, six.string_types):
-                    continue
-
-                # NOTE(aarefiev): verify provided value with introspection
-                # data format specifications.
-                # TODO(aarefiev): simple verify on import rule time.
                 try:
-                    act.params[formatted_param] = value.format(data=data)
-                except KeyError as e:
-                    raise utils.Error(_('Invalid formatting variable key '
-                                        'provided: %s') % e,
-                                      node_info=node_info, data=data)
+                    initial = act.params[formatted_param]
+                except KeyError:
+                    # Ignore parameter that wasn't given.
+                    continue
+                else:
+                    act.params[formatted_param] = _format_value(initial, data)
 
-            LOG.debug('Running %(what)s action `%(action)s %(params)s`',
-                      {'action': act.action, 'params': act.params,
-                       'what': method},
+            LOG.debug('Running action `%(action)s %(params)s`',
+                      {'action': act.action, 'params': act.params},
                       node_info=node_info, data=data)
-            getattr(ext, method)(node_info, act.params)
+            ext.apply(node_info, act.params)
 
-        LOG.debug('Successfully applied %s',
-                  'rollback actions' if rollback else 'actions',
+        LOG.debug('Successfully applied actions',
                   node_info=node_info, data=data)
+
+    def check_scope(self, node_info):
+        """Check if node's scope falls under rule._scope and rule is applicable
+
+        :param node_info: a NodeInfo object
+        :returns: True if conditions match, otherwise False
+        """
+        if not self._scope:
+            LOG.debug('Rule "%s" is global and will be applied if conditions '
+                      'are met.', self._description)
+            return True
+        if self._scope == node_info.node().properties.get('inspection_scope'):
+            LOG.debug('Rule "%s" and node have a matching scope "%s and will '
+                      'be applied if conditions are met.', self._description,
+                      self._scope)
+            return True
+        else:
+            LOG.debug('Rule\'s "%s" scope "%s" does not match node\'s scope. '
+                      'Rule will be ignored', self._description, self._scope)
+            return False
+
+
+def _format_value(value, data):
+    """Apply parameter formatting to a value.
+
+    Format strings with the values from `data`. If `value` is a dict or
+    list, any string members (and any nested string members) will also be
+    formatted recursively. This includes both keys and values for dicts.
+
+    :param value: The string to format, or container whose members to
+                  format.
+    :param data: Introspection data.
+    :returns: `value`, formatted with the parameters from `data`.
+    """
+    if isinstance(value, str):
+        # NOTE(aarefiev): verify provided value with introspection
+        # data format specifications.
+        # TODO(aarefiev): simple verify on import rule time.
+        try:
+            return value.format(data=data)
+        except KeyError as e:
+            raise utils.Error(_('Invalid formatting variable key '
+                                'provided in value %(val)s: %(e)s'),
+                              {'val': value, 'e': e}, data=data)
+    elif isinstance(value, dict):
+        return {_format_value(k, data): _format_value(v, data)
+                for k, v in value.items()}
+    elif isinstance(value, list):
+        return [_format_value(v, data) for v in value]
+    else:
+        # Assume this is a 'primitive' value.
+        return value
 
 
 def _parse_path(path):
@@ -248,41 +287,17 @@ def _parse_path(path):
     return scheme, path
 
 
-def create(conditions_json, actions_json, uuid=None,
-           description=None):
-    """Create a new rule in database.
+def _validate_conditions(conditions_json):
+    """Validates conditions from jsonschema.
 
-    :param conditions_json: list of dicts with the following keys:
-                            * op - operator
-                            * field - JSON path to field to compare
-                            Other keys are stored as is.
-    :param actions_json: list of dicts with the following keys:
-                         * action - action type
-                         Other keys are stored as is.
-    :param uuid: rule UUID, will be generated if empty
-    :param description: human-readable rule description
-    :returns: new IntrospectionRule object
-    :raises: utils.Error on failure
+    :returns: a list of conditions.
     """
-    uuid = uuid or uuidutils.generate_uuid()
-    LOG.debug('Creating rule %(uuid)s with description "%(descr)s", '
-              'conditions %(conditions)s and actions %(actions)s',
-              {'uuid': uuid, 'descr': description,
-               'conditions': conditions_json, 'actions': actions_json})
-
     try:
         jsonschema.validate(conditions_json, conditions_schema())
     except jsonschema.ValidationError as exc:
         raise utils.Error(_('Validation failed for conditions: %s') % exc)
 
-    try:
-        jsonschema.validate(actions_json, actions_schema())
-    except jsonschema.ValidationError as exc:
-        raise utils.Error(_('Validation failed for actions: %s') % exc)
-
     cond_mgr = plugins_base.rule_conditions_manager()
-    act_mgr = plugins_base.rule_actions_manager()
-
     conditions = []
     reserved_params = {'op', 'field', 'multiple', 'invert'}
     for cond_json in conditions_json:
@@ -315,7 +330,20 @@ def create(conditions_json, actions_json, uuid=None,
                            cond_json.get('multiple', 'any'),
                            cond_json.get('invert', False),
                            params))
+    return conditions
 
+
+def _validate_actions(actions_json):
+    """Validates actions from jsonschema.
+
+    :returns: a list of actions.
+    """
+    try:
+        jsonschema.validate(actions_json, actions_schema())
+    except jsonschema.ValidationError as exc:
+        raise utils.Error(_('Validation failed for actions: %s') % exc)
+
+    act_mgr = plugins_base.rule_actions_manager()
     actions = []
     for action_json in actions_json:
         plugin = act_mgr[action_json['action']].obj
@@ -328,11 +356,41 @@ def create(conditions_json, actions_json, uuid=None,
                               {'act': action_json['action'], 'error': exc})
 
         actions.append((action_json['action'], params))
+    return actions
+
+
+def create(conditions_json, actions_json, uuid=None,
+           description=None, scope=None):
+    """Create a new rule in database.
+
+    :param conditions_json: list of dicts with the following keys:
+                            * op - operator
+                            * field - JSON path to field to compare
+                            Other keys are stored as is.
+    :param actions_json: list of dicts with the following keys:
+                         * action - action type
+                         Other keys are stored as is.
+    :param uuid: rule UUID, will be generated if empty
+    :param description: human-readable rule description
+    :param scope: if scope on node and rule matches, rule applies;
+                  if its empty, rule applies to all nodes.
+    :returns: new IntrospectionRule object
+    :raises: utils.Error on failure
+    """
+    uuid = uuid or uuidutils.generate_uuid()
+    LOG.debug('Creating rule %(uuid)s with description "%(descr)s", '
+              'conditions %(conditions)s, scope "%(scope)s"'
+              ' and actions %(actions)s',
+              {'uuid': uuid, 'descr': description, 'scope': scope,
+               'conditions': conditions_json, 'actions': actions_json})
+
+    conditions = _validate_conditions(conditions_json)
+    actions = _validate_actions(actions_json)
 
     try:
         with db.ensure_transaction() as session:
-            rule = db.Rule(uuid=uuid, description=description,
-                           disabled=False, created_at=timeutils.utcnow())
+            rule = db.Rule(uuid=uuid, description=description, disabled=False,
+                           created_at=timeutils.utcnow(), scope=scope)
 
             for field, op, multiple, invert, params in conditions:
                 rule.conditions.append(db.RuleCondition(op=op,
@@ -347,17 +405,19 @@ def create(conditions_json, actions_json, uuid=None,
 
             rule.save(session)
     except db_exc.DBDuplicateEntry as exc:
-        LOG.error(_LE('Database integrity error %s when '
-                      'creating a rule'), exc)
+        LOG.error('Database integrity error %s when '
+                  'creating a rule', exc)
         raise utils.Error(_('Rule with UUID %s already exists') % uuid,
                           code=409)
 
-    LOG.info(_LI('Created rule %(uuid)s with description "%(descr)s"'),
-             {'uuid': uuid, 'descr': description})
+    LOG.info('Created rule %(uuid)s with description "%(descr)s" '
+             'and scope "%(scope)s"',
+             {'uuid': uuid, 'descr': description, 'scope': scope})
     return IntrospectionRule(uuid=uuid,
                              conditions=rule.conditions,
                              actions=rule.actions,
-                             description=description)
+                             description=description,
+                             scope=rule.scope)
 
 
 def get(uuid):
@@ -369,7 +429,8 @@ def get(uuid):
 
     return IntrospectionRule(uuid=rule.uuid, actions=rule.actions,
                              conditions=rule.conditions,
-                             description=rule.description)
+                             description=rule.description,
+                             scope=rule.scope)
 
 
 def get_all():
@@ -377,7 +438,8 @@ def get_all():
     query = db.model_query(db.Rule).order_by(db.Rule.created_at)
     return [IntrospectionRule(uuid=rule.uuid, actions=rule.actions,
                               conditions=rule.conditions,
-                              description=rule.description)
+                              description=rule.description,
+                              scope=rule.scope)
             for rule in query]
 
 
@@ -393,7 +455,7 @@ def delete(uuid):
         if not count:
             raise utils.Error(_('Rule %s was not found') % uuid, code=404)
 
-    LOG.info(_LI('Introspection rule %s was deleted'), uuid)
+    LOG.info('Introspection rule %s was deleted', uuid)
 
 
 def delete_all():
@@ -403,7 +465,7 @@ def delete_all():
         db.model_query(db.RuleCondition, session=session).delete()
         db.model_query(db.Rule, session=session).delete()
 
-    LOG.info(_LI('All introspection rules were deleted'))
+    LOG.info('All introspection rules were deleted')
 
 
 def apply(node_info, data):
@@ -417,28 +479,18 @@ def apply(node_info, data):
     LOG.debug('Applying custom introspection rules',
               node_info=node_info, data=data)
 
-    to_rollback = []
     to_apply = []
     for rule in rules:
-        if rule.check_conditions(node_info, data):
+        if (rule.check_scope(node_info) and
+                rule.check_conditions(node_info, data)):
             to_apply.append(rule)
-        else:
-            to_rollback.append(rule)
-
-    if to_rollback:
-        LOG.debug('Running rollback actions', node_info=node_info, data=data)
-        for rule in to_rollback:
-            rule.apply_actions(node_info, rollback=True, data=data)
-    else:
-        LOG.debug('No rollback actions to apply',
-                  node_info=node_info, data=data)
 
     if to_apply:
         LOG.debug('Running actions', node_info=node_info, data=data)
         for rule in to_apply:
-            rule.apply_actions(node_info, rollback=False, data=data)
+            rule.apply_actions(node_info, data=data)
     else:
         LOG.debug('No actions to apply', node_info=node_info, data=data)
 
-    LOG.info(_LI('Successfully applied custom introspection rules'),
+    LOG.info('Successfully applied custom introspection rules',
              node_info=node_info, data=data)

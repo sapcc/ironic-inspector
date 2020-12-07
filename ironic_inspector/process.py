@@ -17,20 +17,17 @@ import copy
 import datetime
 import os
 
-import eventlet
-import json
-
 from oslo_config import cfg
 from oslo_serialization import base64
 from oslo_utils import excutils
+from oslo_utils import timeutils
 
-from ironic_inspector.common.i18n import _, _LE, _LI, _LW
+from ironic_inspector.common.i18n import _
 from ironic_inspector.common import ironic as ir_utils
-from ironic_inspector.common import swift
-from ironic_inspector import firewall
 from ironic_inspector import introspection_state as istate
 from ironic_inspector import node_cache
 from ironic_inspector.plugins import base as plugins_base
+from ironic_inspector.pxe_filter import base as pxe_filter
 from ironic_inspector import rules
 from ironic_inspector import utils
 
@@ -38,23 +35,20 @@ CONF = cfg.CONF
 
 LOG = utils.getProcessingLogger(__name__)
 
-_CREDENTIALS_WAIT_RETRIES = 10
-_CREDENTIALS_WAIT_PERIOD = 3
 _STORAGE_EXCLUDED_KEYS = {'logs'}
-_UNPROCESSED_DATA_STORE_SUFFIX = 'UNPROCESSED'
 
 
 def _store_logs(introspection_data, node_info):
     logs = introspection_data.get('logs')
     if not logs:
-        LOG.warning(_LW('No logs were passed by the ramdisk'),
+        LOG.warning('No logs were passed by the ramdisk',
                     data=introspection_data, node_info=node_info)
         return
 
     if not CONF.processing.ramdisk_logs_dir:
-        LOG.warning(_LW('Failed to store logs received from the ramdisk '
-                        'because ramdisk_logs_dir configuration option '
-                        'is not set'),
+        LOG.warning('Failed to store logs received from the ramdisk '
+                    'because ramdisk_logs_dir configuration option '
+                    'is not set',
                     data=introspection_data, node_info=node_info)
         return
 
@@ -76,19 +70,34 @@ def _store_logs(introspection_data, node_info):
                   'wb') as fp:
             fp.write(base64.decode_as_bytes(logs))
     except EnvironmentError:
-        LOG.exception(_LE('Could not store the ramdisk logs'),
+        LOG.exception('Could not store the ramdisk logs',
                       data=introspection_data, node_info=node_info)
     else:
-        LOG.info(_LI('Ramdisk logs were stored in file %s'), file_name,
+        LOG.info('Ramdisk logs were stored in file %s', file_name,
                  data=introspection_data, node_info=node_info)
 
 
 def _find_node_info(introspection_data, failures):
     try:
-        return node_cache.find_node(
-            bmc_address=introspection_data.get('ipmi_address'),
-            mac=utils.get_valid_macs(introspection_data))
+        address = utils.get_ipmi_address_from_data(introspection_data)
+        v6address = utils.get_ipmi_v6address_from_data(introspection_data)
+        bmc_addresses = list(filter(None, [address, v6address]))
+        macs = utils.get_valid_macs(introspection_data)
+        return node_cache.find_node(bmc_address=bmc_addresses,
+                                    mac=macs)
     except utils.NotFoundInCacheError as exc:
+        if CONF.processing.permit_active_introspection:
+            try:
+                return node_cache.record_node(bmc_addresses=bmc_addresses,
+                                              macs=macs)
+            except utils.NotFoundInCacheError:
+                LOG.debug(
+                    'Active nodes introspection is enabled, but no node '
+                    'was found for MAC(s) %(mac)s and BMC address(es) '
+                    '%(addr)s; proceeding with discovery',
+                    {'mac': ', '.join(macs) if macs else None,
+                     'addr': ', '.join(filter(None, bmc_addresses)) or None})
+
         not_found_hook = plugins_base.node_not_found_hook_manager()
         if not_found_hook is None:
             failures.append(_('Look up error: %s') % exc)
@@ -123,15 +132,15 @@ def _run_pre_hooks(introspection_data, failures):
         try:
             hook_ext.obj.before_processing(introspection_data)
         except utils.Error as exc:
-            LOG.error(_LE('Hook %(hook)s failed, delaying error report '
-                          'until node look up: %(error)s'),
+            LOG.error('Hook %(hook)s failed, delaying error report '
+                      'until node look up: %(error)s',
                       {'hook': hook_ext.name, 'error': exc},
                       data=introspection_data)
             failures.append('Preprocessing hook %(hook)s: %(error)s' %
                             {'hook': hook_ext.name, 'error': exc})
         except Exception as exc:
-            LOG.exception(_LE('Hook %(hook)s failed, delaying error report '
-                              'until node look up: %(error)s'),
+            LOG.exception('Hook %(hook)s failed, delaying error report '
+                          'until node look up: %(error)s',
                           {'hook': hook_ext.name, 'error': exc},
                           data=introspection_data)
             failures.append(_('Unexpected exception %(exc_class)s during '
@@ -146,48 +155,44 @@ def _filter_data_excluded_keys(data):
             if k not in _STORAGE_EXCLUDED_KEYS}
 
 
-def _store_data(node_info, data, suffix=None):
-    if CONF.processing.store_data != 'swift':
-        LOG.debug("Swift support is disabled, introspection data "
-                  "won't be stored", node_info=node_info)
-        return
+def store_introspection_data(node_uuid, data, processed=True):
+    """Store introspection data to the storage backend.
 
-    swift_object_name = swift.store_introspection_data(
-        _filter_data_excluded_keys(data),
-        node_info.uuid,
-        suffix=suffix
-    )
-    LOG.info(_LI('Introspection data was stored in Swift in object '
-                 '%s'), swift_object_name, node_info=node_info)
-    if CONF.processing.store_data_location:
-        node_info.patch([{'op': 'add', 'path': '/extra/%s' %
-                          CONF.processing.store_data_location,
-                          'value': swift_object_name}])
+    :param node_uuid: node UUID
+    :param data: Introspection data to be saved
+    :param processed: The type of introspection data, set to True means the
+                      introspection data is processed, otherwise unprocessed.
+    :raises: utils.Error
+    """
+    introspection_data_manager = plugins_base.introspection_data_manager()
+    store = CONF.processing.store_data
+    ext = introspection_data_manager[store].obj
+    ext.save(node_uuid, data, processed)
 
 
-def _store_unprocessed_data(node_info, data):
+def _store_unprocessed_data(node_uuid, data):
     # runs in background
     try:
-        _store_data(node_info, data,
-                    suffix=_UNPROCESSED_DATA_STORE_SUFFIX)
+        store_introspection_data(node_uuid, data, processed=False)
     except Exception:
-        LOG.exception(_LE('Encountered exception saving unprocessed '
-                          'introspection data'), node_info=node_info,
-                      data=data)
+        LOG.exception('Encountered exception saving unprocessed '
+                      'introspection data for node %s', node_uuid, data=data)
 
 
-def _get_unprocessed_data(uuid):
-    if CONF.processing.store_data == 'swift':
-        LOG.debug('Fetching unprocessed introspection data from '
-                  'Swift for %s', uuid)
-        return json.loads(
-            swift.get_introspection_data(
-                uuid,
-                suffix=_UNPROCESSED_DATA_STORE_SUFFIX
-            )
-        )
-    else:
-        raise utils.Error(_('Swift support is disabled'), code=400)
+def get_introspection_data(uuid, processed=True, get_json=False):
+    """Get introspection data from the storage backend.
+
+    :param uuid: node UUID
+    :param processed: Indicates the type of introspection data to be read,
+                      set True to request processed introspection data.
+    :param get_json: Specify whether return the introspection data in json
+                     format, string value is returned if False.
+    :raises: utils.Error
+    """
+    introspection_data_manager = plugins_base.introspection_data_manager()
+    store = CONF.processing.store_data
+    ext = introspection_data_manager[store].obj
+    return ext.get(uuid, processed=processed, get_json=get_json)
 
 
 def process(introspection_data):
@@ -208,11 +213,11 @@ def process(introspection_data):
         msg = _('The following failures happened during running '
                 'pre-processing hooks:\n%s') % '\n'.join(failures)
         if node_info is not None:
-            node_info.finished(error='\n'.join(failures))
+            node_info.finished(istate.Events.error, error='\n'.join(failures))
         _store_logs(introspection_data, node_info)
         raise utils.Error(msg, node_info=node_info, data=introspection_data)
 
-    LOG.info(_LI('Matching node is %s'), node_info.uuid,
+    LOG.info('Matching node is %s', node_info.uuid,
              node_info=node_info, data=introspection_data)
 
     if node_info.finished_at is not None:
@@ -224,28 +229,28 @@ def process(introspection_data):
     # Note(mkovacik): store data now when we're sure that a background
     # thread won't race with other process() or introspect.abort()
     # call
-    utils.executor().submit(_store_unprocessed_data, node_info,
+    utils.executor().submit(_store_unprocessed_data, node_info.uuid,
                             unprocessed_data)
 
     try:
         node = node_info.node()
     except ir_utils.NotFound as exc:
         with excutils.save_and_reraise_exception():
-            node_info.finished(error=str(exc))
+            node_info.finished(istate.Events.error, error=str(exc))
             _store_logs(introspection_data, node_info)
 
     try:
         result = _process_node(node_info, node, introspection_data)
     except utils.Error as exc:
-        node_info.finished(error=str(exc))
+        node_info.finished(istate.Events.error, error=str(exc))
         with excutils.save_and_reraise_exception():
             _store_logs(introspection_data, node_info)
     except Exception as exc:
-        LOG.exception(_LE('Unexpected exception during processing'))
+        LOG.exception('Unexpected exception during processing')
         msg = _('Unexpected exception %(exc_class)s during processing: '
                 '%(error)s') % {'exc_class': exc.__class__.__name__,
                                 'error': exc}
-        node_info.finished(error=msg)
+        node_info.finished(istate.Events.error, error=msg)
         _store_logs(introspection_data, node_info)
         raise utils.Error(msg, node_info=node_info, data=introspection_data,
                           code=500)
@@ -267,115 +272,71 @@ def _run_post_hooks(node_info, introspection_data):
 @node_cache.fsm_transition(istate.Events.process, reentrant=False)
 def _process_node(node_info, node, introspection_data):
     # NOTE(dtantsur): repeat the check in case something changed
-    ir_utils.check_provision_state(node)
-
-    node_info.create_ports(introspection_data.get('macs') or ())
+    keep_power_on = ir_utils.check_provision_state(node)
 
     _run_post_hooks(node_info, introspection_data)
-    _store_data(node_info, introspection_data)
+    store_introspection_data(node_info.uuid, introspection_data)
 
     ironic = ir_utils.get_client()
-    firewall.update_filters(ironic)
+    pxe_filter.driver().sync(ironic)
 
     node_info.invalidate_cache()
     rules.apply(node_info, introspection_data)
 
-    resp = {'uuid': node.uuid}
+    resp = {'uuid': node.id}
 
-    if node_info.options.get('new_ipmi_credentials'):
-        new_username, new_password = (
-            node_info.options.get('new_ipmi_credentials'))
-        utils.executor().submit(_finish_set_ipmi_credentials,
-                                node_info, ironic, node, introspection_data,
-                                new_username, new_password)
-        resp['ipmi_setup_credentials'] = True
-        resp['ipmi_username'] = new_username
-        resp['ipmi_password'] = new_password
+    # determine how to handle power
+    if keep_power_on or not node_info.manage_boot:
+        power_action = False
     else:
-        utils.executor().submit(_finish, node_info, ironic, introspection_data,
-                                power_off=CONF.processing.power_off)
+        power_action = CONF.processing.power_off
+    utils.executor().submit(_finish, node_info, ironic, introspection_data,
+                            power_off=power_action)
 
     return resp
 
 
-@node_cache.fsm_transition(istate.Events.finish)
-def _finish_set_ipmi_credentials(node_info, ironic, node, introspection_data,
-                                 new_username, new_password):
-    patch = [{'op': 'add', 'path': '/driver_info/ipmi_username',
-              'value': new_username},
-             {'op': 'add', 'path': '/driver_info/ipmi_password',
-              'value': new_password}]
-    new_ipmi_address = utils.get_ipmi_address_from_data(introspection_data)
-    if not ir_utils.get_ipmi_address(node) and new_ipmi_address:
-        patch.append({'op': 'add', 'path': '/driver_info/ipmi_address',
-                      'value': new_ipmi_address})
-    node_info.patch(patch)
-
-    for attempt in range(_CREDENTIALS_WAIT_RETRIES):
-        try:
-            # We use this call because it requires valid credentials.
-            # We don't care about boot device, obviously.
-            ironic.node.get_boot_device(node_info.uuid)
-        except Exception as exc:
-            LOG.info(_LI('Waiting for credentials update, attempt %(attempt)d '
-                         'current error is %(exc)s'),
-                     {'attempt': attempt, 'exc': exc},
-                     node_info=node_info, data=introspection_data)
-            eventlet.greenthread.sleep(_CREDENTIALS_WAIT_PERIOD)
-        else:
-            _finish_common(node_info, ironic, introspection_data)
-            return
-
-    msg = (_('Failed to validate updated IPMI credentials for node '
-             '%s, node might require maintenance') % node_info.uuid)
-    node_info.finished(error=msg)
-    raise utils.Error(msg, node_info=node_info, data=introspection_data)
-
-
-def _finish_common(node_info, ironic, introspection_data, power_off=True):
+@node_cache.triggers_fsm_error_transition()
+def _finish(node_info, ironic, introspection_data, power_off=True):
     if power_off:
         LOG.debug('Forcing power off of node %s', node_info.uuid)
         try:
-            ironic.node.set_power_state(node_info.uuid, 'off')
+            ironic.set_node_power_state(node_info.uuid, 'power off')
         except Exception as exc:
             if node_info.node().provision_state == 'enroll':
-                LOG.info(_LI("Failed to power off the node in"
-                             "'enroll' state, ignoring; error was "
-                             "%s"), exc, node_info=node_info,
+                LOG.info("Failed to power off the node in"
+                         "'enroll' state, ignoring; error was "
+                         "%s", exc, node_info=node_info,
                          data=introspection_data)
             else:
                 msg = (_('Failed to power off node %(node)s, check '
                          'its power management configuration: '
                          '%(exc)s') % {'node': node_info.uuid, 'exc':
                                        exc})
-                node_info.finished(error=msg)
                 raise utils.Error(msg, node_info=node_info,
                                   data=introspection_data)
-        LOG.info(_LI('Node powered-off'), node_info=node_info,
+        LOG.info('Node powered-off', node_info=node_info,
                  data=introspection_data)
 
-    node_info.finished()
-    LOG.info(_LI('Introspection finished successfully'),
+    node_info.finished(istate.Events.finish)
+    LOG.info('Introspection finished successfully',
              node_info=node_info, data=introspection_data)
 
 
-_finish = node_cache.fsm_transition(istate.Events.finish)(_finish_common)
-
-
-def reapply(node_ident):
+def reapply(node_uuid, data=None):
     """Re-apply introspection steps.
 
     Re-apply preprocessing, postprocessing and introspection rules on
     stored data.
 
-    :param node_ident: node UUID or name
+    :param node_uuid: node UUID
+    :param data: unprocessed introspection data to be reapplied
     :raises: utils.Error
-
     """
 
     LOG.debug('Processing re-apply introspection request for node '
-              'UUID: %s', node_ident)
-    node_info = node_cache.get_node(node_ident, locked=False)
+              'UUID: %s', node_uuid)
+    node_info = node_cache.get_node(node_uuid)
     if not node_info.acquire_lock(blocking=False):
         # Note (mkovacik): it should be sufficient to check data
         # presence & locking. If either introspection didn't start
@@ -384,22 +345,13 @@ def reapply(node_ident):
         raise utils.Error(_('Node locked, please, try again later'),
                           node_info=node_info, code=409)
 
-    utils.executor().submit(_reapply, node_info)
+    utils.executor().submit(_reapply, node_info, introspection_data=data)
 
 
-def _reapply(node_info):
+def _reapply(node_info, introspection_data=None):
     # runs in background
-    try:
-        introspection_data = _get_unprocessed_data(node_info.uuid)
-    except Exception as exc:
-        LOG.exception(_LE('Encountered exception while fetching '
-                          'stored introspection data'),
-                      node_info=node_info)
-        msg = (_('Unexpected exception %(exc_class)s while fetching '
-                 'unprocessed introspection data from Swift: %(error)s') %
-               {'exc_class': exc.__class__.__name__, 'error': exc})
-        node_info.finished(error=msg)
-        return
+    node_info.started_at = timeutils.utcnow()
+    node_info.commit()
 
     try:
         ironic = ir_utils.get_client()
@@ -407,21 +359,22 @@ def _reapply(node_info):
         msg = _('Encountered an exception while getting the Ironic client: '
                 '%s') % exc
         LOG.error(msg, node_info=node_info, data=introspection_data)
-        node_info.fsm_event(istate.Events.error)
-        node_info.finished(error=msg)
+        node_info.finished(istate.Events.error, error=msg)
         return
 
     try:
         _reapply_with_data(node_info, introspection_data)
     except Exception as exc:
-        node_info.finished(error=str(exc))
+        msg = (_('Failed reapply for node %(node)s, Error: '
+                 '%(exc)s') % {'node': node_info.uuid, 'exc': exc})
+        LOG.error(msg, node_info=node_info, data=introspection_data)
         return
 
     _finish(node_info, ironic, introspection_data,
             power_off=False)
 
-    LOG.info(_LI('Successfully reapplied introspection on stored '
-                 'data'), node_info=node_info, data=introspection_data)
+    LOG.info('Successfully reapplied introspection on stored '
+             'data', node_info=node_info, data=introspection_data)
 
 
 @node_cache.fsm_event_before(istate.Events.reapply)
@@ -434,8 +387,7 @@ def _reapply_with_data(node_info, introspection_data):
                             'introspection on stored data:\n%s') %
                           '\n'.join(failures), node_info=node_info)
 
-    node_info.create_ports(introspection_data.get('macs') or ())
     _run_post_hooks(node_info, introspection_data)
-    _store_data(node_info, introspection_data)
+    store_introspection_data(node_info.uuid, introspection_data)
     node_info.invalidate_cache()
     rules.apply(node_info, introspection_data)

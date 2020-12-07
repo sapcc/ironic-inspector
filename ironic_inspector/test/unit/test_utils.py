@@ -11,18 +11,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from unittest import mock
+
 from keystonemiddleware import auth_token
+from openstack.baremetal.v1 import node
 from oslo_config import cfg
 
+from ironic_inspector.common import context
 from ironic_inspector import node_cache
 from ironic_inspector.test import base
 from ironic_inspector import utils
-from ironicclient.v1 import node
-
-try:
-    from unittest import mock
-except ImportError:
-    import mock
 
 CONF = cfg.CONF
 
@@ -30,17 +28,16 @@ CONF = cfg.CONF
 class TestCheckAuth(base.BaseTest):
     def setUp(self):
         super(TestCheckAuth, self).setUp()
-        CONF.set_override('auth_strategy', 'keystone')
+        self.cfg.config(auth_strategy='keystone')
 
-    @mock.patch.object(auth_token, 'AuthProtocol')
+    @mock.patch.object(auth_token, 'AuthProtocol', autospec=True)
     def test_middleware(self, mock_auth):
-        CONF.set_override('admin_user', 'admin', 'keystone_authtoken')
-        CONF.set_override('admin_tenant_name', 'admin', 'keystone_authtoken')
-        CONF.set_override('admin_password', 'password', 'keystone_authtoken')
-        CONF.set_override('auth_uri', 'http://127.0.0.1:5000',
-                          'keystone_authtoken')
-        CONF.set_override('identity_uri', 'http://127.0.0.1:35357',
-                          'keystone_authtoken')
+        self.cfg.config(group='keystone_authtoken',
+                        admin_user='admin',
+                        admin_tenant_name='admin',
+                        admin_password='password',
+                        www_authenticate_uri='http://127.0.0.1:5000',
+                        identity_uri='http://127.0.0.1:35357')
 
         app = mock.Mock(wsgi_app=mock.sentinel.app)
         utils.add_auth_middleware(app)
@@ -54,56 +51,40 @@ class TestCheckAuth(base.BaseTest):
         self.assertEqual('admin', args1['admin_tenant_name'])
         self.assertEqual('password', args1['admin_password'])
         self.assertTrue(args1['delay_auth_decision'])
-        self.assertEqual('http://127.0.0.1:5000', args1['auth_uri'])
+        self.assertEqual('http://127.0.0.1:5000',
+                         args1['www_authenticate_uri'])
         self.assertEqual('http://127.0.0.1:35357', args1['identity_uri'])
 
-    @mock.patch.object(auth_token, 'AuthProtocol')
-    def test_add_auth_middleware_with_deprecated_items(self, mock_auth):
-        CONF.set_override('os_password', 'os_password', 'ironic')
-        CONF.set_override('admin_password', 'admin_password',
-                          'keystone_authtoken')
-        CONF.set_override('os_username', 'os_username', 'ironic')
-        CONF.set_override('admin_user', 'admin_user', 'keystone_authtoken')
-        CONF.set_override('os_auth_url', 'os_auth_url', 'ironic')
-        CONF.set_override('auth_uri', 'auth_uri', 'keystone_authtoken')
-        CONF.set_override('os_tenant_name', 'os_tenant_name', 'ironic')
-        CONF.set_override('admin_tenant_name', 'admin_tenant_name',
-                          'keystone_authtoken')
-        CONF.set_override('identity_uri', 'identity_uri_ironic', 'ironic')
-        CONF.set_override('identity_uri', 'identity_uri', 'keystone_authtoken')
-
-        app = mock.Mock(wsgi_app=mock.sentinel.app)
-        utils.add_auth_middleware(app)
-
-        call_args = mock_auth.call_args_list[0]
-        args = call_args[0]
-        self.assertEqual(mock.sentinel.app, args[0])
-        args1 = args[1]
-        self.assertEqual('os_password', args1['admin_password'])
-        self.assertEqual('os_username', args1['admin_user'])
-        self.assertEqual('os_auth_url', args1['auth_uri'])
-        self.assertEqual('os_tenant_name', args1['admin_tenant_name'])
-        self.assertTrue(args1['delay_auth_decision'])
-        self.assertEqual('identity_uri_ironic', args1['identity_uri'])
-
-    def test_ok(self):
-        request = mock.Mock(headers={'X-Identity-Status': 'Confirmed',
-                                     'X-Roles': 'admin,member'})
-        utils.check_auth(request)
+    def test_admin(self):
+        request = mock.Mock(headers={'X-Identity-Status': 'Confirmed'})
+        request.context = context.RequestContext(roles=['admin'])
+        utils.check_auth(request, rule="is_admin")
 
     def test_invalid(self):
         request = mock.Mock(headers={'X-Identity-Status': 'Invalid'})
+        request.context = context.RequestContext()
         self.assertRaises(utils.Error, utils.check_auth, request)
 
     def test_not_admin(self):
-        request = mock.Mock(headers={'X-Identity-Status': 'Confirmed',
-                                     'X-Roles': 'member'})
-        self.assertRaises(utils.Error, utils.check_auth, request)
+        request = mock.Mock(headers={'X-Identity-Status': 'Confirmed'})
+        request.context = context.RequestContext(roles=['member'])
+        self.assertRaises(utils.Error, utils.check_auth, request,
+                          rule="is_admin")
 
     def test_disabled(self):
-        CONF.set_override('auth_strategy', 'noauth')
+        self.cfg.config(auth_strategy='noauth')
         request = mock.Mock(headers={'X-Identity-Status': 'Invalid'})
         utils.check_auth(request)
+
+    def test_basic(self):
+        self.cfg.config(auth_strategy='http_basic')
+        request = mock.Mock(headers={'X-Identity-Status': 'Invalid'})
+        utils.check_auth(request)
+
+    def test_public_api(self):
+        request = mock.Mock(headers={'X-Identity-Status': 'Invalid'})
+        request.context = context.RequestContext(is_public_api=True)
+        utils.check_auth(request, "public_api")
 
 
 class TestProcessingLogger(base.BaseTest):
@@ -112,7 +93,7 @@ class TestProcessingLogger(base.BaseTest):
                          utils.processing_logger_prefix())
 
     def test_prefix_only_uuid(self):
-        node_info = node.Node(mock.Mock(), dict(uuid='NNN'))
+        node_info = mock.Mock(uuid='NNN', spec=node.Node)
         self.assertEqual('[node: NNN]',
                          utils.processing_logger_prefix(node_info=node_info))
 
@@ -127,7 +108,7 @@ class TestProcessingLogger(base.BaseTest):
                          utils.processing_logger_prefix(data=data))
 
     def test_prefix_everything(self):
-        node_info = node.Node(mock.Mock(), dict(uuid='NNN'))
+        node_info = mock.Mock(uuid='NNN', spec=node.Node)
         data = {'boot_interface': '01-aa-bb-cc-dd-ee-ff',
                 'inventory': {'bmc_address': '1.2.3.4'}}
         self.assertEqual('[node: NNN MAC aa:bb:cc:dd:ee:ff BMC 1.2.3.4]',
@@ -135,29 +116,22 @@ class TestProcessingLogger(base.BaseTest):
                                                         data=data))
 
     def test_prefix_uuid_not_str(self):
-        node_info = node.Node(mock.Mock(), dict(uuid=None))
+        node_info = mock.Mock(uuid=None, spec=node.Node)
         self.assertEqual('[node: None]',
                          utils.processing_logger_prefix(node_info=node_info))
 
     def test_prefix_NodeInfo_instance(self):
         node_info = node_cache.NodeInfo('NNN')
-        self.assertEqual('[node: NNN state None]',
+        self.assertEqual('[node: NNN]',
                          utils.processing_logger_prefix(node_info=node_info))
 
-    def test_adapter_no_bmc(self):
-        CONF.set_override('log_bmc_address', False, 'processing')
-        node_info = node.Node(mock.Mock(), dict(uuid='NNN'))
-        data = {'boot_interface': '01-aa-bb-cc-dd-ee-ff',
-                'inventory': {'bmc_address': '1.2.3.4'}}
-        logger = utils.getProcessingLogger(__name__)
-        msg, _kwargs = logger.process('foo', {'node_info': node_info,
-                                              'data': data})
-        self.assertEqual(
-            '[node: NNN MAC aa:bb:cc:dd:ee:ff] foo',
-            msg)
+    def test_prefix_NodeInfo_instance_with_state(self):
+        node_info = node_cache.NodeInfo('NNN', state='foobar')
+        self.assertEqual('[node: NNN state foobar]',
+                         utils.processing_logger_prefix(node_info=node_info))
 
     def test_adapter_with_bmc(self):
-        node_info = node.Node(mock.Mock(), dict(uuid='NNN'))
+        node_info = mock.Mock(uuid='NNN', spec=node.Node)
         data = {'boot_interface': '01-aa-bb-cc-dd-ee-ff',
                 'inventory': {'bmc_address': '1.2.3.4'}}
         logger = utils.getProcessingLogger(__name__)

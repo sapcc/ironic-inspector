@@ -14,7 +14,9 @@
 
 """Tests for introspection rules plugins."""
 
-import mock
+from unittest import mock
+
+from openstack import exceptions as os_exc
 
 from ironic_inspector.common import ironic as ir_utils
 from ironic_inspector import node_cache
@@ -157,15 +159,51 @@ class TestSetAttributeAction(test_base.NodeTest):
         self.assertRaises(ValueError, self.act.validate, {'value': 42})
         self.assertRaises(ValueError, self.act.validate,
                           {'path': '/extra/value'})
+        self.params['value'] = None
+        self.act.validate(self.params)
 
-    @mock.patch.object(node_cache.NodeInfo, 'patch')
+    @mock.patch.object(node_cache.NodeInfo, 'patch', autospec=True)
     def test_apply(self, mock_patch):
         self.act.apply(self.node_info, self.params)
-        mock_patch.assert_called_once_with([{'op': 'add',
-                                             'path': '/extra/value',
-                                             'value': 42}])
+        mock_patch.assert_called_once_with(
+            self.node_info,
+            [{'op': 'add', 'path': '/extra/value', 'value': 42}])
+
+    @mock.patch.object(node_cache.NodeInfo, 'patch', autospec=True)
+    def test_apply_driver(self, mock_patch):
+        params = {'path': '/driver', 'value': 'ipmi'}
+        self.act.apply(self.node_info, params)
+        mock_patch.assert_called_once_with(
+            self.node_info,
+            [{'op': 'add', 'path': '/driver', 'value': 'ipmi'}],
+            reset_interfaces=True)
+
+    @mock.patch.object(node_cache.NodeInfo, 'patch', autospec=True)
+    def test_apply_driver_no_reset_interfaces(self, mock_patch):
+        params = {'path': '/driver', 'value': 'ipmi',
+                  'reset_interfaces': False}
+        self.act.apply(self.node_info, params)
+        mock_patch.assert_called_once_with(
+            self.node_info,
+            [{'op': 'add', 'path': '/driver', 'value': 'ipmi'}])
+
+    @mock.patch.object(node_cache.NodeInfo, 'patch', autospec=True)
+    def test_apply_driver_not_supported(self, mock_patch):
+        for exc in (TypeError, os_exc.SDKException):
+            mock_patch.reset_mock()
+            mock_patch.side_effect = [exc, None]
+            params = {'path': '/driver', 'value': 'ipmi'}
+            self.act.apply(self.node_info, params)
+            mock_patch.assert_has_calls([
+                mock.call(self.node_info,
+                          [{'op': 'add', 'path': '/driver', 'value': 'ipmi'}],
+                          reset_interfaces=True),
+                mock.call(self.node_info,
+                          [{'op': 'add', 'path': '/driver', 'value': 'ipmi'}])
+            ])
 
 
+@mock.patch('ironic_inspector.common.ironic.get_client', new=mock.Mock())
 class TestSetCapabilityAction(test_base.NodeTest):
     act = rules_plugins.SetCapabilityAction()
     params = {'name': 'cap1', 'value': 'val'}
@@ -174,23 +212,25 @@ class TestSetCapabilityAction(test_base.NodeTest):
         self.act.validate(self.params)
         self.assertRaises(ValueError, self.act.validate, {'value': 42})
 
-    @mock.patch.object(node_cache.NodeInfo, 'patch')
+    @mock.patch.object(node_cache.NodeInfo, 'patch', autospec=True)
     def test_apply(self, mock_patch):
         self.act.apply(self.node_info, self.params)
         mock_patch.assert_called_once_with(
+            self.node_info,
             [{'op': 'add', 'path': '/properties/capabilities',
               'value': 'cap1:val'}], mock.ANY)
 
-    @mock.patch.object(node_cache.NodeInfo, 'patch')
+    @mock.patch.object(node_cache.NodeInfo, 'patch', autospec=True)
     def test_apply_with_existing(self, mock_patch):
         self.node.properties['capabilities'] = 'x:y,cap1:old_val,answer:42'
         self.act.apply(self.node_info, self.params)
 
-        patch = mock_patch.call_args[0][0]
+        patch = mock_patch.call_args[0][1]
         new_caps = ir_utils.capabilities_to_dict(patch[0]['value'])
         self.assertEqual({'cap1': 'val', 'x': 'y', 'answer': '42'}, new_caps)
 
 
+@mock.patch('ironic_inspector.common.ironic.get_client', new=mock.Mock())
 class TestExtendAttributeAction(test_base.NodeTest):
     act = rules_plugins.ExtendAttributeAction()
     params = {'path': '/extra/value', 'value': 42}
@@ -199,24 +239,63 @@ class TestExtendAttributeAction(test_base.NodeTest):
         self.act.validate(self.params)
         self.assertRaises(ValueError, self.act.validate, {'value': 42})
 
-    @mock.patch.object(node_cache.NodeInfo, 'patch')
+    @mock.patch.object(node_cache.NodeInfo, 'patch', autospec=True)
     def test_apply(self, mock_patch):
         self.act.apply(self.node_info, self.params)
         mock_patch.assert_called_once_with(
+            self.node_info,
             [{'op': 'add', 'path': '/extra/value', 'value': [42]}], mock.ANY)
 
-    @mock.patch.object(node_cache.NodeInfo, 'patch')
+    @mock.patch.object(node_cache.NodeInfo, 'patch', autospec=True)
     def test_apply_non_empty(self, mock_patch):
         self.node.extra['value'] = [0]
         self.act.apply(self.node_info, self.params)
 
         mock_patch.assert_called_once_with(
+            self.node_info,
             [{'op': 'replace', 'path': '/extra/value', 'value': [0, 42]}],
             mock.ANY)
 
-    @mock.patch.object(node_cache.NodeInfo, 'patch')
+    @mock.patch.object(node_cache.NodeInfo, 'patch', autospec=True)
     def test_apply_unique_with_existing(self, mock_patch):
         params = dict(unique=True, **self.params)
         self.node.extra['value'] = [42]
         self.act.apply(self.node_info, params)
         self.assertFalse(mock_patch.called)
+
+
+@mock.patch('ironic_inspector.common.ironic.get_client', autospec=True)
+class TestAddTraitAction(test_base.NodeTest):
+    act = rules_plugins.AddTraitAction()
+    params = {'name': 'CUSTOM_FOO'}
+
+    def test_validate(self, mock_cli):
+        self.act.validate(self.params)
+        self.assertRaises(ValueError, self.act.validate, {'value': 42})
+
+    def test_add(self, mock_cli):
+        self.act.apply(self.node_info, self.params)
+        mock_cli.return_value.add_node_trait.assert_called_once_with(
+            self.uuid, 'CUSTOM_FOO')
+
+
+@mock.patch('ironic_inspector.common.ironic.get_client', autospec=True)
+class TestRemoveTraitAction(test_base.NodeTest):
+    act = rules_plugins.RemoveTraitAction()
+    params = {'name': 'CUSTOM_FOO'}
+
+    def test_validate(self, mock_cli):
+        self.act.validate(self.params)
+        self.assertRaises(ValueError, self.act.validate, {'value': 42})
+
+    def test_remove(self, mock_cli):
+        self.act.apply(self.node_info, self.params)
+        mock_cli.return_value.remove_node_trait.assert_called_once_with(
+            self.uuid, 'CUSTOM_FOO')
+
+    def test_remove_not_found(self, mock_cli):
+        mock_cli.return_value.remove_node_trait.side_effect = (
+            os_exc.NotFoundException('trait not found'))
+        self.act.apply(self.node_info, self.params)
+        mock_cli.return_value.remove_node_trait.assert_called_once_with(
+            self.uuid, 'CUSTOM_FOO')

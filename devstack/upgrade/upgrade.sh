@@ -45,6 +45,7 @@ source $TARGET_DEVSTACK_DIR/lib/neutron-legacy
 source $TARGET_DEVSTACK_DIR/lib/apache
 source $TARGET_DEVSTACK_DIR/lib/keystone
 source $TARGET_DEVSTACK_DIR/lib/database
+source $TARGET_DEVSTACK_DIR/lib/rpc_backend
 
 # Inspector relies on couple of Ironic variables
 source $TARGET_RELEASE_DIR/ironic/devstack/lib/ironic
@@ -71,10 +72,12 @@ if  [[ -d $IRONIC_INSPECTOR_CONF_DIR ]] && [[ ! -d $SAVE_DIR/etc.inspector ]] ; 
     cp -pr $IRONIC_INSPECTOR_CONF_DIR $SAVE_DIR/etc.inspector
 fi
 
-stack_install_service ironic-inspector
+# This call looks for install_<NAME>, which is install_inspector in our case:
+# https://github.com/openstack-dev/devstack/blob/dec121114c3ea6f9e515a452700e5015d1e34704/lib/stack#L32
+stack_install_service inspector
 
-if [[ "$IRONIC_INSPECTOR_MANAGE_FIREWALL" == "True" ]]; then
-    stack_install_service ironic-inspector-dhcp
+if is_inspector_dhcp_required; then
+    stack_install_service inspector_dhcp
 fi
 
 $IRONIC_INSPECTOR_DBSYNC_BIN_FILE --config-file $IRONIC_INSPECTOR_CONF_FILE upgrade
@@ -82,20 +85,19 @@ $IRONIC_INSPECTOR_DBSYNC_BIN_FILE --config-file $IRONIC_INSPECTOR_CONF_FILE upgr
 # calls upgrade inspector for specific release
 upgrade_project ironic-inspector $RUN_DIR $BASE_DEVSTACK_BRANCH $TARGET_DEVSTACK_BRANCH
 
+# setup transport_url for rpc messaging
+iniset_rpc_backend ironic-inspector $IRONIC_INSPECTOR_CONF_FILE
 
 start_inspector
-
-if [[ "$IRONIC_INSPECTOR_MANAGE_FIREWALL" == "True" ]]; then
+if is_inspector_dhcp_required; then
     start_inspector_dhcp
 fi
 
 # Don't succeed unless the services come up
 ensure_services_started ironic-inspector
-ensure_logs_exist ironic-inspector
 
-if [[ "$IRONIC_INSPECTOR_MANAGE_FIREWALL" == "True" ]]; then
+if is_inspector_dhcp_required; then
     ensure_services_started dnsmasq
-    ensure_logs_exist ironic-inspector-dhcp
 fi
 
 set +o xtrace

@@ -15,30 +15,27 @@
 
 import binascii
 
-from ironicclient import exc as client_exc
+from construct import core
 import netaddr
+from openstack import exceptions
 from oslo_config import cfg
+from oslo_utils import netutils
 
-from ironic_inspector.common.i18n import _LW, _LE
-from ironic_inspector.common import ironic
+from ironic_inspector.common import lldp_parsers
+from ironic_inspector.common import lldp_tlvs as tlv
 from ironic_inspector.plugins import base
 from ironic_inspector import utils
 
 LOG = utils.getProcessingLogger(__name__)
 
-# NOTE(sambetts) Constants defined according to IEEE standard for LLDP
-# http://standards.ieee.org/getieee802/download/802.1AB-2009.pdf
-LLDP_TLV_TYPE_CHASSIS_ID = 1
-LLDP_TLV_TYPE_PORT_ID = 2
-PORT_ID_SUBTYPE_MAC = 3
-PORT_ID_SUBTYPE_IFNAME = 5
-PORT_ID_SUBTYPE_LOCAL = 7
-STRING_PORT_SUBTYPES = [PORT_ID_SUBTYPE_IFNAME, PORT_ID_SUBTYPE_LOCAL]
-CHASSIS_ID_SUBTYPE_MAC = 4
-
 CONF = cfg.CONF
 
-REQUIRED_IRONIC_VERSION = '1.19'
+PORT_ID_ITEM_NAME = "port_id"
+SWITCH_ID_ITEM_NAME = "switch_id"
+
+LLDP_PROC_DATA_MAPPING =\
+    {lldp_parsers.LLDP_CHASSIS_ID_NM: SWITCH_ID_ITEM_NAME,
+     lldp_parsers.LLDP_PORT_ID_NM: PORT_ID_ITEM_NAME}
 
 
 class GenericLocalLinkConnectionHook(base.ProcessingHook):
@@ -50,35 +47,64 @@ class GenericLocalLinkConnectionHook(base.ProcessingHook):
     fields on the Ironic port that represents that NIC.
     """
 
-    def _get_local_link_patch(self, tlv_type, tlv_value, port):
+    def _get_local_link_patch(self, tlv_type, tlv_value, port, node_info):
         try:
             data = bytearray(binascii.unhexlify(tlv_value))
         except TypeError:
-            LOG.warning(_LW("TLV value for TLV type %d not in correct"
-                            "format, ensure TLV value is in "
-                            "hexidecimal format when sent to "
-                            "inspector"), tlv_type)
+            LOG.warning("TLV value for TLV type %d not in correct"
+                        "format, ensure TLV value is in "
+                        "hexidecimal format when sent to "
+                        "inspector", tlv_type, node_info=node_info)
             return
 
         item = value = None
-        if tlv_type == LLDP_TLV_TYPE_PORT_ID:
-            # Check to ensure the port id is an allowed type
-            item = "port_id"
-            if data[0] in STRING_PORT_SUBTYPES:
-                value = data[1:].decode()
-            if data[0] == PORT_ID_SUBTYPE_MAC:
-                value = str(netaddr.EUI(
-                    binascii.hexlify(data[1:]).decode(),
-                    dialect=netaddr.mac_unix_expanded))
-        elif tlv_type == LLDP_TLV_TYPE_CHASSIS_ID:
-            # Check to ensure the chassis id is the allowed type
-            if data[0] == CHASSIS_ID_SUBTYPE_MAC:
-                item = "switch_id"
-                value = str(netaddr.EUI(
-                    binascii.hexlify(data[1:]).decode(),
-                    dialect=netaddr.mac_unix_expanded))
+        if tlv_type == tlv.LLDP_TLV_PORT_ID:
+            try:
+                port_id = tlv.PortId.parse(data)
+            except (core.MappingError, netaddr.AddrFormatError) as e:
+                LOG.warning("TLV parse error for Port ID: %s", e,
+                            node_info=node_info)
+                return
+
+            item = PORT_ID_ITEM_NAME
+            value = port_id.value.value if port_id.value else None
+        elif tlv_type == tlv.LLDP_TLV_CHASSIS_ID:
+            try:
+                chassis_id = tlv.ChassisId.parse(data)
+            except (core.MappingError, netaddr.AddrFormatError) as e:
+                LOG.warning("TLV parse error for Chassis ID: %s", e,
+                            node_info=node_info)
+                return
+
+            # Only accept mac address for chassis ID
+            if 'mac_address' in chassis_id.subtype:
+                item = SWITCH_ID_ITEM_NAME
+                value = chassis_id.value.value
 
         if item and value:
+            if (not CONF.processing.overwrite_existing and
+                    item in port.local_link_connection):
+                return
+            return {'op': 'add',
+                    'path': '/local_link_connection/%s' % item,
+                    'value': value}
+
+    def _get_lldp_processed_patch(self, name, item, lldp_proc_data, port,
+                                  node_info):
+
+        if 'lldp_processed' not in lldp_proc_data:
+            return
+
+        value = lldp_proc_data['lldp_processed'].get(name)
+
+        if value:
+            # Only accept mac address for chassis ID
+            if (item == SWITCH_ID_ITEM_NAME and
+                    not netutils.is_valid_mac(value)):
+                LOG.info("Skipping switch_id since it's not a MAC: %s", value,
+                         node_info=node_info)
+                return
+
             if (not CONF.processing.overwrite_existing and
                     item in port.local_link_connection):
                 return
@@ -106,29 +132,34 @@ class GenericLocalLinkConnectionHook(base.ProcessingHook):
 
             lldp_data = iface.get('lldp')
             if lldp_data is None:
-                LOG.warning(_LW("No LLDP Data found for interface %s"),
+                LOG.warning("No LLDP Data found for interface %s",
                             mac_address, node_info=node_info,
                             data=introspection_data)
                 continue
 
             patches = []
-            for tlv_type, tlv_value in lldp_data:
-                patch = self._get_local_link_patch(tlv_type, tlv_value, port)
+            # First check if lldp data was already processed by lldp_basic
+            # plugin which stores data in 'all_interfaces'
+            proc_data = introspection_data['all_interfaces'][iface['name']]
+
+            for name, item in LLDP_PROC_DATA_MAPPING.items():
+                patch = self._get_lldp_processed_patch(name, item,
+                                                       proc_data, port,
+                                                       node_info)
                 if patch is not None:
                     patches.append(patch)
 
+            # If no processed lldp data was available then parse raw lldp data
+            if not patches:
+                for tlv_type, tlv_value in lldp_data:
+                    patch = self._get_local_link_patch(tlv_type, tlv_value,
+                                                       port, node_info)
+                    if patch is not None:
+                        patches.append(patch)
+
             try:
-                # NOTE(sambetts) We need a newer version of Ironic API for this
-                # transaction, so create a new ironic client and explicitly
-                # pass it into the function.
-                cli = ironic.get_client(api_version=REQUIRED_IRONIC_VERSION)
-                node_info.patch_port(port, patches, ironic=cli)
-            except client_exc.NotAcceptable:
-                LOG.error(_LE("Unable to set Ironic port local link "
-                              "connection information because Ironic does not "
-                              "support the required version"),
-                          node_info=node_info, data=introspection_data)
-                # NOTE(sambetts) May as well break out out of the loop here
-                # because Ironic version is not going to change for the other
-                # interfaces.
-                break
+                node_info.patch_port(port, patches)
+            except exceptions.BadRequestException as e:
+                LOG.warning("Failed to update port %(uuid)s: %(error)s",
+                            {'uuid': port.uuid, 'error': e},
+                            node_info=node_info)

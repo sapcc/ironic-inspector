@@ -13,22 +13,19 @@
 
 """Standard set of plugins."""
 
-import sys
-
 from ironic_lib import utils as il_utils
 import netaddr
 from oslo_config import cfg
 from oslo_utils import netutils
 from oslo_utils import units
-import six
 
-from ironic_inspector.common.i18n import _, _LC, _LE, _LI, _LW
-from ironic_inspector import conf
+
+from ironic_inspector.common.i18n import _
+from ironic_inspector.common import ironic as ir_utils
 from ironic_inspector.plugins import base
 from ironic_inspector import utils
 
 CONF = cfg.CONF
-
 
 LOG = utils.getProcessingLogger('ironic_inspector.plugins.standard')
 
@@ -40,7 +37,8 @@ class RootDiskSelectionHook(base.ProcessingHook):
     might not be updated.
     """
 
-    def before_update(self, introspection_data, node_info, **kwargs):
+    def _process_root_device_hints(self, introspection_data, node_info,
+                                   inventory):
         """Detect root disk from root device hints and IPA inventory."""
         hints = node_info.node().properties.get('root_device')
         if not hints:
@@ -48,8 +46,6 @@ class RootDiskSelectionHook(base.ProcessingHook):
                       node_info=node_info, data=introspection_data)
             return
 
-        inventory = utils.get_inventory(introspection_data,
-                                        node_info=node_info)
         try:
             device = il_utils.match_root_device_hints(inventory['disks'],
                                                       hints)
@@ -70,77 +66,87 @@ class RootDiskSelectionHook(base.ProcessingHook):
                   node_info=node_info, data=introspection_data)
         introspection_data['root_disk'] = device
 
+    def before_update(self, introspection_data, node_info, **kwargs):
+        """Process root disk information."""
+        inventory = utils.get_inventory(introspection_data,
+                                        node_info=node_info)
+        self._process_root_device_hints(introspection_data, node_info,
+                                        inventory)
+
+        root_disk = introspection_data.get('root_disk')
+        if root_disk:
+            local_gb = root_disk['size'] // units.Gi
+            if not local_gb:
+                LOG.warning('The requested root disk is too small (smaller '
+                            'than 1 GiB) or its size cannot be detected: %s',
+                            root_disk,
+                            node_info=node_info, data=introspection_data)
+            else:
+                if CONF.processing.disk_partitioning_spacing:
+                    local_gb -= 1
+                LOG.info('Root disk %(disk)s, local_gb %(local_gb)s GiB',
+                         {'disk': root_disk, 'local_gb': local_gb},
+                         node_info=node_info, data=introspection_data)
+        else:
+            local_gb = 0
+            LOG.info('No root device found, assuming a diskless node',
+                     node_info=node_info, data=introspection_data)
+
+        introspection_data['local_gb'] = local_gb
+        if (CONF.processing.overwrite_existing or not
+                node_info.node().properties.get('local_gb')):
+            node_info.update_properties(local_gb=str(local_gb))
+
 
 class SchedulerHook(base.ProcessingHook):
     """Nova scheduler required properties."""
 
-    KEYS = ('cpus', 'cpu_arch', 'memory_mb', 'local_gb')
+    KEYS = ('cpus', 'cpu_arch', 'memory_mb')
 
     def before_update(self, introspection_data, node_info, **kwargs):
         """Update node with scheduler properties."""
         inventory = utils.get_inventory(introspection_data,
                                         node_info=node_info)
-        errors = []
-
-        root_disk = introspection_data.get('root_disk')
-        if root_disk:
-            introspection_data['local_gb'] = root_disk['size'] // units.Gi
-            if CONF.processing.disk_partitioning_spacing:
-                introspection_data['local_gb'] -= 1
-        else:
-            errors.append(_('root disk is not supplied by the ramdisk and '
-                            'root_disk_selection hook is not enabled'))
-
         try:
             introspection_data['cpus'] = int(inventory['cpu']['count'])
-            introspection_data['cpu_arch'] = six.text_type(
+            introspection_data['cpu_arch'] = str(
                 inventory['cpu']['architecture'])
         except (KeyError, ValueError, TypeError):
-            errors.append(_('malformed or missing CPU information: %s') %
-                          inventory.get('cpu'))
+            LOG.warning('malformed or missing CPU information: %s',
+                        inventory.get('cpu'))
 
         try:
             introspection_data['memory_mb'] = int(
                 inventory['memory']['physical_mb'])
         except (KeyError, ValueError, TypeError):
-            errors.append(_('malformed or missing memory information: %s; '
-                            'introspection requires physical memory size '
-                            'from dmidecode') % inventory.get('memory'))
+            LOG.warning('malformed or missing memory information: %s; '
+                        'introspection requires physical memory size '
+                        'from dmidecode', inventory.get('memory'))
 
-        if errors:
-            raise utils.Error(_('The following problems encountered: %s') %
-                              '; '.join(errors),
-                              node_info=node_info, data=introspection_data)
-
-        LOG.info(_LI('Discovered data: CPUs: %(cpus)s %(cpu_arch)s, '
-                     'memory %(memory_mb)s MiB, disk %(local_gb)s GiB'),
+        LOG.info('Discovered data: CPUs: count %(cpus)s, architecture '
+                 '%(cpu_arch)s, memory %(memory_mb)s MiB',
                  {key: introspection_data.get(key) for key in self.KEYS},
                  node_info=node_info, data=introspection_data)
 
         overwrite = CONF.processing.overwrite_existing
         properties = {key: str(introspection_data[key])
-                      for key in self.KEYS if overwrite or
-                      not node_info.node().properties.get(key)}
-        node_info.update_properties(**properties)
+                      for key in self.KEYS if introspection_data.get(key) and
+                      (overwrite or not node_info.node().properties.get(key))}
+        if properties:
+            node_info.update_properties(**properties)
 
 
 class ValidateInterfacesHook(base.ProcessingHook):
     """Hook to validate network interfaces."""
 
     def __init__(self):
-        if CONF.processing.add_ports not in conf.VALID_ADD_PORTS_VALUES:
-            LOG.critical(_LC('Accepted values for [processing]add_ports are '
-                             '%(valid)s, got %(actual)s'),
-                         {'valid': conf.VALID_ADD_PORTS_VALUES,
-                          'actual': CONF.processing.add_ports})
-            sys.exit(1)
-
-        if CONF.processing.keep_ports not in conf.VALID_KEEP_PORTS_VALUES:
-            LOG.critical(_LC('Accepted values for [processing]keep_ports are '
-                             '%(valid)s, got %(actual)s'),
-                         {'valid': conf.VALID_KEEP_PORTS_VALUES,
-                          'actual': CONF.processing.keep_ports})
-            sys.exit(1)
+        # Some configuration checks
+        if (CONF.processing.add_ports == 'disabled' and
+                CONF.processing.keep_ports == 'added'):
+            msg = _("Configuration error: add_ports set to disabled "
+                    "and keep_ports set to added. Please change keep_ports "
+                    "to all.")
+            raise utils.Error(msg)
 
     def _get_interfaces(self, data=None):
         """Convert inventory to a dict with interfaces.
@@ -150,13 +156,22 @@ class ValidateInterfacesHook(base.ProcessingHook):
         result = {}
         inventory = utils.get_inventory(data)
 
+        pxe_mac = utils.get_pxe_mac(data)
+
         for iface in inventory['interfaces']:
             name = iface.get('name')
             mac = iface.get('mac_address')
-            ip = iface.get('ipv4_address')
+            ipv4_address = iface.get('ipv4_address')
+            ipv6_address = iface.get('ipv6_address')
+            # NOTE(kaifeng) ipv6 address may in the form of fd00::1%enp2s0,
+            # which is not supported by netaddr, remove the suffix if exists.
+            if ipv6_address and '%' in ipv6_address:
+                ipv6_address = ipv6_address.split('%')[0]
+            ip = ipv4_address or ipv6_address
+            client_id = iface.get('client_id')
 
             if not name:
-                LOG.error(_LE('Malformed interface record: %s'),
+                LOG.error('Malformed interface record: %s',
                           iface, data=data)
                 continue
 
@@ -166,18 +181,20 @@ class ValidateInterfacesHook(base.ProcessingHook):
                 continue
 
             if not netutils.is_valid_mac(mac):
-                LOG.warning(_LW('MAC %(mac)s for interface %(name)s is '
-                                'not valid, skipping'),
+                LOG.warning('MAC %(mac)s for interface %(name)s is '
+                            'not valid, skipping',
                             {'mac': mac, 'name': name},
                             data=data)
                 continue
 
             mac = mac.lower()
 
-            LOG.debug('Found interface %(name)s with MAC "%(mac)s" and '
-                      'IP address "%(ip)s"',
-                      {'name': name, 'mac': mac, 'ip': ip}, data=data)
-            result[name] = {'ip': ip, 'mac': mac}
+            LOG.debug('Found interface %(name)s with MAC "%(mac)s", '
+                      'IP address "%(ip)s" and client_id "%(client_id)s"',
+                      {'name': name, 'mac': mac, 'ip': ip,
+                       'client_id': client_id}, data=data)
+            result[name] = {'ip': ip, 'mac': mac, 'client_id': client_id,
+                            'pxe': (mac == pxe_mac)}
 
         return result
 
@@ -192,21 +209,20 @@ class ValidateInterfacesHook(base.ProcessingHook):
 
         pxe_mac = utils.get_pxe_mac(data)
         if not pxe_mac and CONF.processing.add_ports == 'pxe':
-            LOG.warning(_LW('No boot interface provided in the introspection '
-                            'data, will add all ports with IP addresses'))
+            LOG.warning('No boot interface provided in the introspection '
+                        'data, will add all ports with IP addresses')
 
         result = {}
 
         for name, iface in interfaces.items():
-            mac = iface.get('mac')
             ip = iface.get('ip')
+            pxe = iface.get('pxe', True)
 
             if name == 'lo' or (ip and netaddr.IPAddress(ip).is_loopback()):
                 LOG.debug('Skipping local interface %s', name, data=data)
                 continue
 
-            if (CONF.processing.add_ports == 'pxe' and pxe_mac
-                    and mac != pxe_mac):
+            if CONF.processing.add_ports == 'pxe' and pxe_mac and not pxe:
                 LOG.debug('Skipping interface %s as it was not PXE booting',
                           name, data=data)
                 continue
@@ -216,7 +232,7 @@ class ValidateInterfacesHook(base.ProcessingHook):
                           name, data=data)
                 continue
 
-            result[name] = {'ip': ip, 'mac': mac.lower()}
+            result[name] = iface
 
         if not result:
             raise utils.Error(_('No suitable interfaces found in %s') %
@@ -227,9 +243,11 @@ class ValidateInterfacesHook(base.ProcessingHook):
         """Validate information about network interfaces."""
 
         bmc_address = utils.get_ipmi_address_from_data(introspection_data)
-        if bmc_address:
-            introspection_data['ipmi_address'] = bmc_address
-        else:
+        bmc_v6address = utils.get_ipmi_v6address_from_data(introspection_data)
+        # Overwrite the old ipmi_address field to avoid inconsistency
+        introspection_data['ipmi_address'] = bmc_address
+        introspection_data['ipmi_v6address'] = bmc_v6address
+        if not (bmc_address or bmc_v6address):
             LOG.debug('No BMC address provided in introspection data, '
                       'assuming virtual environment', data=introspection_data)
 
@@ -238,7 +256,7 @@ class ValidateInterfacesHook(base.ProcessingHook):
         interfaces = self._validate_interfaces(all_interfaces,
                                                introspection_data)
 
-        LOG.info(_LI('Using network interface(s): %s'),
+        LOG.info('Using network interface(s): %s',
                  ', '.join('%s %s' % (name, items)
                            for (name, items) in interfaces.items()),
                  data=introspection_data)
@@ -249,7 +267,11 @@ class ValidateInterfacesHook(base.ProcessingHook):
         introspection_data['macs'] = valid_macs
 
     def before_update(self, introspection_data, node_info, **kwargs):
-        """Drop ports that are not present in the data."""
+        """Create new ports and drop ports that are not present in the data."""
+        interfaces = introspection_data.get('interfaces')
+        if CONF.processing.add_ports != 'disabled':
+            node_info.create_ports(list(interfaces.values()))
+
         if CONF.processing.keep_ports == 'present':
             expected_macs = {
                 iface['mac']
@@ -257,19 +279,46 @@ class ValidateInterfacesHook(base.ProcessingHook):
             }
         elif CONF.processing.keep_ports == 'added':
             expected_macs = set(introspection_data['macs'])
-        else:
+
+        node_provision_state = node_info.node().provision_state
+        if node_provision_state in ir_utils.VALID_ACTIVE_STATES:
+            LOG.debug('Node %(node)s is %(state)s; '
+                      'not modifying / deleting its ports',
+                      {'node': node_info.uuid,
+                       'state': node_provision_state})
             return
 
-        # list is required as we modify underlying dict
-        for port in list(node_info.ports().values()):
-            if port.address not in expected_macs:
-                LOG.info(_LI("Deleting port %(port)s as its MAC %(mac)s is "
-                             "not in expected MAC list %(expected)s"),
-                         {'port': port.uuid,
-                          'mac': port.address,
-                          'expected': list(sorted(expected_macs))},
-                         node_info=node_info, data=introspection_data)
-                node_info.delete_port(port)
+        if CONF.processing.keep_ports != 'all':
+            # list is required as we modify underlying dict
+            for port in list(node_info.ports().values()):
+                if port.address not in expected_macs:
+                    LOG.info("Deleting port %(port)s as its MAC %(mac)s is "
+                             "not in expected MAC list %(expected)s",
+                             {'port': port.uuid,
+                              'mac': port.address,
+                              'expected': list(sorted(expected_macs))},
+                             node_info=node_info, data=introspection_data)
+                    node_info.delete_port(port)
+
+        if (CONF.processing.overwrite_existing
+                and CONF.processing.update_pxe_enabled):
+            # Make sure is_pxe_enabled is up-to-date
+            ports = node_info.ports()
+            for iface in introspection_data['interfaces'].values():
+                try:
+                    port = ports[iface['mac']]
+                except KeyError:
+                    continue
+
+                real_pxe = iface.get('pxe', True)
+                if port.is_pxe_enabled != real_pxe:
+                    LOG.info('Fixing is_pxe_enabled=%(val)s on port %(port)s '
+                             'to match introspected data',
+                             {'port': port.address, 'val': real_pxe},
+                             node_info=node_info, data=introspection_data)
+                    node_info.patch_port(port, [{'op': 'replace',
+                                                 'path': '/pxe_enabled',
+                                                 'value': real_pxe}])
 
 
 class RamdiskErrorHook(base.ProcessingHook):

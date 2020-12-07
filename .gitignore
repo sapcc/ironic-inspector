@@ -6,7 +6,8 @@
 
 # Sphinx
 _build
-#doc/source/api/
+doc/source/contributor/api/
+doc/source/_static/*.sample
 
 # release notes build
 releasenotes/build
@@ -27,6 +28,7 @@ develop-eggs
 # Other
 *.DS_Store
 .idea
+.stestr
 .testrepository
 .tox
 .venv
@@ -40,4 +42,3 @@ ChangeLog
 
 # Vagrant
 .vagrant
-doc/source/api/

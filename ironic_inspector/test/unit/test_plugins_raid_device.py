@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import mock
+from unittest import mock
 
 from ironic_inspector import node_cache
 from ironic_inspector.plugins import base
@@ -43,7 +43,7 @@ class TestRaidDeviceDetection(test_base.NodeTest):
 class TestRaidDeviceDetectionUpdate(test_base.NodeTest):
     hook = raid_device.RaidDeviceDetection()
 
-    @mock.patch.object(node_cache.NodeInfo, 'patch')
+    @mock.patch.object(node_cache.NodeInfo, 'patch', autospec=True)
     def _check(self, data, patch, mock_patch):
         self.hook.before_processing(data)
         self.hook.before_update(data, self.node_info)

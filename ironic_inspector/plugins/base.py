@@ -17,19 +17,23 @@ import abc
 
 from oslo_config import cfg
 from oslo_log import log
-import six
 import stevedore
 
-from ironic_inspector.common.i18n import _, _LW
+from ironic_inspector.common.i18n import _
 
 
 CONF = cfg.CONF
 LOG = log.getLogger(__name__)
 
 
-@six.add_metaclass(abc.ABCMeta)
-class ProcessingHook(object):  # pragma: no cover
+class ProcessingHook(object, metaclass=abc.ABCMeta):  # pragma: no cover
     """Abstract base class for introspection data processing hooks."""
+
+    dependencies = []
+    """An ordered list of hooks that must be enabled before this one.
+
+    The items here should be entry point names, not classes.
+    """
 
     def before_processing(self, introspection_data, **kwargs):
         """Hook to run before any other data processing.
@@ -91,8 +95,7 @@ class WithValidation(object):
             raise ValueError('; '.join(msg))
 
 
-@six.add_metaclass(abc.ABCMeta)
-class RuleConditionPlugin(WithValidation):  # pragma: no cover
+class RuleConditionPlugin(WithValidation, metaclass=abc.ABCMeta):  # pragma: no cover # noqa
     """Abstract base class for rule condition plugins."""
 
     REQUIRED_PARAMS = {'value'}
@@ -114,8 +117,7 @@ class RuleConditionPlugin(WithValidation):  # pragma: no cover
         """
 
 
-@six.add_metaclass(abc.ABCMeta)
-class RuleActionPlugin(WithValidation):  # pragma: no cover
+class RuleActionPlugin(WithValidation, metaclass=abc.ABCMeta):  # pragma: no cover # noqa
     """Abstract base class for rule action plugins."""
 
     FORMATTED_PARAMS = []
@@ -131,28 +133,33 @@ class RuleActionPlugin(WithValidation):  # pragma: no cover
         :raises: utils.Error on failure
         """
 
-    def rollback(self, node_info, params, **kwargs):
-        """Rollback action effects from previous run on a failed match.
-
-        Default implementation does nothing.
-
-        :param node_info: NodeInfo object
-        :param params: parameters as a dictionary
-        :param kwargs: used for extensibility without breaking existing plugins
-        :raises: utils.Error on failure
-        """
-
 
 _HOOKS_MGR = None
 _NOT_FOUND_HOOK_MGR = None
 _CONDITIONS_MGR = None
 _ACTIONS_MGR = None
+_INTROSPECTION_DATA_MGR = None
+
+
+def reset():
+    """Reset cached managers."""
+    global _HOOKS_MGR
+    global _NOT_FOUND_HOOK_MGR
+    global _CONDITIONS_MGR
+    global _ACTIONS_MGR
+    global _INTROSPECTION_DATA_MGR
+
+    _HOOKS_MGR = None
+    _NOT_FOUND_HOOK_MGR = None
+    _CONDITIONS_MGR = None
+    _ACTIONS_MGR = None
+    _INTROSPECTION_DATA_MGR = None
 
 
 def missing_entrypoints_callback(names):
     """Raise MissingHookError with comma-separated list of missing hooks"""
-    missing_names = ', '.join(names)
-    raise MissingHookError(missing_names)
+    error = _('The following hook(s) are missing or failed to load: %s')
+    raise RuntimeError(error % ', '.join(names))
 
 
 def processing_hooks_manager(*args):
@@ -173,6 +180,35 @@ def processing_hooks_manager(*args):
             on_missing_entrypoints_callback=missing_entrypoints_callback,
             name_order=True)
     return _HOOKS_MGR
+
+
+def validate_processing_hooks():
+    """Validate the enabled processing hooks.
+
+    :raises: MissingHookError on missing or failed to load hooks
+    :raises: RuntimeError on validation failure
+    :returns: the list of hooks passed validation
+    """
+    hooks = [ext for ext in processing_hooks_manager()]
+    enabled = set()
+    errors = []
+    for hook in hooks:
+        deps = getattr(hook.obj, 'dependencies', ())
+        missing = [d for d in deps if d not in enabled]
+        if missing:
+            errors.append('Hook %(hook)s requires the following hooks to be '
+                          'enabled before it: %(deps)s. The following hooks '
+                          'are missing: %(missing)s.' %
+                          {'hook': hook.name,
+                           'deps': ', '.join(deps),
+                           'missing': ', '.join(missing)})
+        enabled.add(hook.name)
+
+    if errors:
+        raise RuntimeError("Some hooks failed to load due to dependency "
+                           "problems:\n%s" % "\n".join(errors))
+
+    return hooks
 
 
 def node_not_found_hook_manager(*args):
@@ -204,14 +240,13 @@ def rule_actions_manager():
         _ACTIONS_MGR = stevedore.ExtensionManager(
             'ironic_inspector.rules.actions',
             invoke_on_load=True)
-        for act in _ACTIONS_MGR:
-            # a trick to detect if function was overridden
-            if "rollback" in act.obj.__class__.__dict__:
-                LOG.warning(_LW('Defining "rollback" for introspection rules '
-                                'actions is deprecated (action "%s")'),
-                            act.name)
     return _ACTIONS_MGR
 
 
-class MissingHookError(KeyError):
-    """Exception when hook is not found when processing it."""
+def introspection_data_manager():
+    global _INTROSPECTION_DATA_MGR
+    if _INTROSPECTION_DATA_MGR is None:
+        _INTROSPECTION_DATA_MGR = stevedore.ExtensionManager(
+            'ironic_inspector.introspection_data.store',
+            invoke_on_load=True)
+    return _INTROSPECTION_DATA_MGR

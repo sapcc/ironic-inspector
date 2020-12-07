@@ -5,10 +5,33 @@
 
 # Add any Sphinx extension module names here, as strings. They can be
 # extensions coming with Sphinx (named 'sphinx.ext.*') or your custom ones.
-extensions = ['sphinx.ext.autodoc',
+extensions = ['sphinxcontrib.apidoc',
               'sphinx.ext.viewcode',
-              'oslosphinx'
-              ]
+              'sphinxcontrib.rsvgconverter',
+              'oslo_policy.sphinxext',
+              'oslo_policy.sphinxpolicygen',
+              'oslo_config.sphinxext',
+              'oslo_config.sphinxconfiggen']
+
+try:
+    import openstackdocstheme
+    extensions.append('openstackdocstheme')
+except ImportError:
+    openstackdocstheme = None
+
+openstackdocs_repo_name = 'openstack/ironic-inspector'
+openstackdocs_pdf_link = True
+openstackdocs_use_storyboard = True
+openstackdocs_projects = [
+    'bifrost',
+    'devstack',
+    'ironic',
+    'ironic-python-agent',
+    'oslo.rootwrap',
+    'python-ironicclient',
+    'python-ironic-inspector-client',
+    'tooz',
+]
 
 wsme_protocols = ['restjson']
 
@@ -26,8 +49,13 @@ source_suffix = '.rst'
 master_doc = 'index'
 
 # General information about the project.
-project = u'Ironic Inspector'
-copyright = u'OpenStack Foundation'
+copyright = u'OpenStack Developers'
+
+config_generator_config_file = '../../tools/config-generator.conf'
+sample_config_basename = '_static/ironic-inspector'
+
+policy_generator_config_file = '../../tools/policy-generator.conf'
+sample_policy_basename = '_static/ironic-inspector'
 
 # The version info for the project you're documenting, acts as replacement for
 # |version| and |release|, also used in various other places throughout the
@@ -51,7 +79,7 @@ add_function_parentheses = True
 add_module_names = True
 
 # The name of the Pygments (syntax highlighting) style to use.
-pygments_style = 'sphinx'
+pygments_style = 'native'
 
 # NOTE(cinerama): mock out nova modules so docs can build without warnings
 #import mock
@@ -64,13 +92,18 @@ pygments_style = 'sphinx'
 
 # The theme to use for HTML and HTML Help pages.  Major themes that come with
 # Sphinx are currently 'default' and 'sphinxdoc'.
+if openstackdocstheme is not None:
+    html_theme = 'openstackdocs'
+else:
+    html_theme = 'default'
 #html_theme_path = ["."]
 #html_theme = '_theme'
 #html_static_path = ['_static']
 
 # Output file base name for HTML help builder.
-htmlhelp_basename = '%sdoc' % project
+htmlhelp_basename = 'ironic-inspectordoc'
 
+latex_use_xindy = False
 
 # Grouping the document tree into LaTeX files. List of tuples
 # (source start file, target name, title, author, documentclass
@@ -78,8 +111,8 @@ htmlhelp_basename = '%sdoc' % project
 latex_documents = [
     (
         'index',
-        '%s.tex' % project,
-        u'%s Documentation' % project,
+        'doc-ironic-inspector.tex',
+        u'Ironic Inspector Documentation',
         u'OpenStack Foundation',
         'manual'
     ),
@@ -88,3 +121,13 @@ latex_documents = [
 # -- Options for seqdiag ------------------------------------------------------
 
 seqdiag_html_image_format = "SVG"
+
+# -- sphinxcontrib.apidoc configuration --------------------------------------
+
+apidoc_module_dir = '../../ironic_inspector'
+apidoc_output_dir = 'contributor/api'
+apidoc_excluded_paths = [
+    'migrations',
+    'test',
+    'common/i18n*'
+]

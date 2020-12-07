@@ -24,22 +24,25 @@ The test will then use that db and u/p combo to run the tests.
 
 
 import contextlib
+import datetime
+from unittest import mock
 
 import alembic
 from alembic import script
-import mock
 from oslo_config import cfg
+from oslo_db.sqlalchemy import enginefacade
 from oslo_db.sqlalchemy.migration_cli import ext_alembic
-from oslo_db.sqlalchemy import test_base
+from oslo_db.sqlalchemy import orm
+from oslo_db.sqlalchemy import test_fixtures
 from oslo_db.sqlalchemy import test_migrations
 from oslo_db.sqlalchemy import utils as db_utils
 from oslo_log import log as logging
 from oslo_utils import uuidutils
+from oslotest import base as test_base
 import sqlalchemy
 
-from ironic_inspector.common.i18n import _LE
+from ironic_inspector.cmd import dbsync
 from ironic_inspector import db
-from ironic_inspector import dbsync
 from ironic_inspector import introspection_state as istate
 from ironic_inspector.test import base
 
@@ -47,53 +50,14 @@ CONF = cfg.CONF
 LOG = logging.getLogger(__name__)
 
 
-def _get_connect_string(backend, user, passwd, database):
-    """Get database connection
-
-    Try to get a connection with a very specific set of values, if we get
-    these then we'll run the tests, otherwise they are skipped
-    """
-    if backend == "sqlite":
-        backend = "sqlite"
-    elif backend == "postgres":
-        backend = "postgresql+psycopg2"
-    elif backend == "mysql":
-        backend = "mysql+mysqldb"
-    else:
-        raise Exception("Unrecognized backend: '%s'" % backend)
-
-    return ("%(backend)s://%(user)s:%(passwd)s@localhost/%(database)s"
-            % {'backend': backend, 'user': user, 'passwd': passwd,
-               'database': database})
-
-
-def _is_backend_avail(backend, user, passwd, database):
-    try:
-        connect_uri = _get_connect_string(backend, user, passwd, database)
-        engine = sqlalchemy.create_engine(connect_uri)
-        connection = engine.connect()
-    except Exception:
-        # intentionally catch all to handle exceptions even if we don't
-        # have any backend code loaded.
-        return False
-    else:
-        connection.close()
-        engine.dispose()
-        return True
-
-
-class FakeFacade(object):
-    def __init__(self, engine):
-        self.engine = engine
-
-    def get_engine(self):
-        return self.engine
-
-
 @contextlib.contextmanager
 def patch_with_engine(engine):
-    with mock.patch.object(db, 'create_facade_lazily') as patch_engine:
-        patch_engine.return_value = FakeFacade(engine)
+    with mock.patch.object(db, 'get_writer_session',
+                           autospec=True) as patch_w_sess, \
+            mock.patch.object(db, 'get_reader_session',
+                              autospec=True) as patch_r_sess:
+        patch_w_sess.return_value = patch_r_sess.return_value = (
+            orm.get_maker(engine)())
         yield
 
 
@@ -139,8 +103,8 @@ class WalkVersionsMixin(object):
                 if check:
                     check(engine, data)
         except Exception:
-            LOG.error(_LE("Failed to migrate to version %(version)s on engine "
-                          "%(engine)s"),
+            LOG.error("Failed to migrate to version %(version)s on engine "
+                      "%(engine)s",
                       {'version': version, 'engine': engine})
             raise
 
@@ -172,10 +136,10 @@ class TestWalkVersions(base.BaseTest, WalkVersionsMixin):
         self._pre_upgrade_141.assert_called_with(self.engine)
         self._check_141.assert_called_with(self.engine, test_value)
 
-    @mock.patch.object(script, 'ScriptDirectory')
-    @mock.patch.object(WalkVersionsMixin, '_migrate_up')
+    @mock.patch.object(script, 'ScriptDirectory', autospec=True)
+    @mock.patch.object(WalkVersionsMixin, '_migrate_up', autospec=True)
     def test_walk_versions_all_default(self, _migrate_up, script_directory):
-        fc = script_directory.from_config()
+        fc = script_directory.from_config.return_value
         fc.walk_revisions.return_value = self.versions
         self.migration_ext.version.return_value = None
 
@@ -183,20 +147,20 @@ class TestWalkVersions(base.BaseTest, WalkVersionsMixin):
 
         self.migration_ext.version.assert_called_with()
 
-        upgraded = [mock.call(self.engine, self.config, v.revision,
+        upgraded = [mock.call(self, self.engine, self.config, v.revision,
                     with_data=True) for v in reversed(self.versions)]
         self.assertEqual(self._migrate_up.call_args_list, upgraded)
 
-    @mock.patch.object(script, 'ScriptDirectory')
-    @mock.patch.object(WalkVersionsMixin, '_migrate_up')
+    @mock.patch.object(script, 'ScriptDirectory', autospec=True)
+    @mock.patch.object(WalkVersionsMixin, '_migrate_up', autospec=True)
     def test_walk_versions_all_false(self, _migrate_up, script_directory):
-        fc = script_directory.from_config()
+        fc = script_directory.from_config.return_value
         fc.walk_revisions.return_value = self.versions
         self.migration_ext.version.return_value = None
 
         self._walk_versions(self.engine, self.config)
 
-        upgraded = [mock.call(self.engine, self.config, v.revision,
+        upgraded = [mock.call(self, self.engine, self.config, v.revision,
                     with_data=True) for v in reversed(self.versions)]
         self.assertEqual(upgraded, self._migrate_up.call_args_list)
 
@@ -204,6 +168,7 @@ class TestWalkVersions(base.BaseTest, WalkVersionsMixin):
 class MigrationCheckersMixin(object):
     def setUp(self):
         super(MigrationCheckersMixin, self).setUp()
+        self.engine = enginefacade.writer.get_engine()
         self.config = dbsync._get_alembic_config()
         self.config.ironic_inspector_config = CONF
         # create AlembicExtension with fake config and replace
@@ -214,16 +179,6 @@ class MigrationCheckersMixin(object):
 
     def test_walk_versions(self):
         self._walk_versions(self.engine, self.config)
-
-    def test_connect_fail(self):
-        """Test that we can trigger a database connection failure
-
-        Test that we can fail gracefully to ensure we don't break people
-        without specific database backend
-        """
-        if _is_backend_avail(self.FIXTURE.DRIVER, "openstack_cifail",
-                             self.FIXTURE.USERNAME, self.FIXTURE.DBNAME):
-            self.fail("Shouldn't have connected")
 
     def _check_578f84f38d(self, engine, data):
         nodes = db_utils.get_table(engine, 'nodes')
@@ -364,6 +319,101 @@ class MigrationCheckersMixin(object):
         err_node = nodes.select(nodes.c.uuid == err_node_id).execute().first()
         self.assertEqual(istate.States.error, err_node['state'])
 
+    def _pre_upgrade_d00d6e3f38c4(self, engine):
+        nodes = db_utils.get_table(engine, 'nodes')
+        data = []
+        for finished_at in (None, 1234.0):
+            node = {'uuid': uuidutils.generate_uuid(),
+                    'started_at': 1232.0,
+                    'finished_at': finished_at,
+                    'error': None}
+            nodes.insert().values(node).execute()
+            data.append(node)
+        return data
+
+    def _check_d00d6e3f38c4(self, engine, data):
+        nodes = db_utils.get_table(engine, 'nodes')
+        col_names = [column.name for column in nodes.c]
+
+        self.assertIn('started_at', col_names)
+        self.assertIn('finished_at', col_names)
+        self.assertIsInstance(nodes.c.started_at.type,
+                              sqlalchemy.types.DateTime)
+        self.assertIsInstance(nodes.c.finished_at.type,
+                              sqlalchemy.types.DateTime)
+
+        for node in data:
+            finished_at = datetime.datetime.utcfromtimestamp(
+                node['finished_at']) if node['finished_at'] else None
+            row = nodes.select(nodes.c.uuid == node['uuid']).execute().first()
+            self.assertEqual(
+                datetime.datetime.utcfromtimestamp(node['started_at']),
+                row['started_at'])
+            self.assertEqual(
+                finished_at,
+                row['finished_at'])
+
+    def _pre_upgrade_882b2d84cb1b(self, engine):
+        attributes = db_utils.get_table(engine, 'attributes')
+        nodes = db_utils.get_table(engine, 'nodes')
+        self.node_uuid = uuidutils.generate_uuid()
+        node = {
+            'uuid': self.node_uuid,
+            'started_at': datetime.datetime.utcnow(),
+            'finished_at': None,
+            'error': None,
+            'state': istate.States.starting
+        }
+        nodes.insert().values(node).execute()
+        data = {
+            'uuid': self.node_uuid,
+            'name': 'foo',
+            'value': 'bar'
+        }
+        attributes.insert().values(data).execute()
+
+    def _check_882b2d84cb1b(self, engine, data):
+        attributes = db_utils.get_table(engine, 'attributes')
+        col_names = [column.name for column in attributes.c]
+        self.assertIn('uuid', col_names)
+        self.assertIsInstance(attributes.c.uuid.type, sqlalchemy.types.String)
+        self.assertIn('node_uuid', col_names)
+        self.assertIsInstance(attributes.c.node_uuid.type,
+                              sqlalchemy.types.String)
+        self.assertIn('name', col_names)
+        self.assertIsInstance(attributes.c.name.type, sqlalchemy.types.String)
+        self.assertIn('value', col_names)
+        self.assertIsInstance(attributes.c.value.type, sqlalchemy.types.String)
+
+        row = attributes.select(attributes.c.node_uuid ==
+                                self.node_uuid).execute().first()
+        self.assertEqual(self.node_uuid, row.node_uuid)
+        self.assertNotEqual(self.node_uuid, row.uuid)
+        self.assertIsNotNone(row.uuid)
+        self.assertEqual('foo', row.name)
+        self.assertEqual('bar', row.value)
+
+    def _check_2970d2d44edc(self, engine, data):
+        nodes = db_utils.get_table(engine, 'nodes')
+        data = {'uuid': 'abcd'}
+        nodes.insert().execute(data)
+
+        n = nodes.select(nodes.c.uuid == 'abcd').execute().first()
+        self.assertIsNone(n['manage_boot'])
+
+    def _check_bf8dec16023c(self, engine, data):
+        introspection_data = db_utils.get_table(engine, 'introspection_data')
+        col_names = [column.name for column in introspection_data.c]
+        self.assertIn('uuid', col_names)
+        self.assertIn('processed', col_names)
+        self.assertIn('data', col_names)
+        self.assertIsInstance(introspection_data.c.uuid.type,
+                              sqlalchemy.types.String)
+        self.assertIsInstance(introspection_data.c.processed.type,
+                              sqlalchemy.types.Boolean)
+        self.assertIsInstance(introspection_data.c.data.type,
+                              sqlalchemy.types.Text)
+
     def test_upgrade_and_version(self):
         with patch_with_engine(self.engine):
             self.migration_ext.upgrade('head')
@@ -380,23 +430,30 @@ class MigrationCheckersMixin(object):
 
 class TestMigrationsMySQL(MigrationCheckersMixin,
                           WalkVersionsMixin,
-                          test_base.MySQLOpportunisticTestCase):
-    pass
+                          test_fixtures.OpportunisticDBTestMixin,
+                          test_base.BaseTestCase):
+    FIXTURE = test_fixtures.MySQLOpportunisticFixture
 
 
 class TestMigrationsPostgreSQL(MigrationCheckersMixin,
                                WalkVersionsMixin,
-                               test_base.PostgreSQLOpportunisticTestCase):
-    pass
+                               test_fixtures.OpportunisticDBTestMixin,
+                               test_base.BaseTestCase):
+    FIXTURE = test_fixtures.PostgresqlOpportunisticFixture
 
 
 class TestMigrationSqlite(MigrationCheckersMixin,
                           WalkVersionsMixin,
-                          test_base.DbTestCase):
-    pass
+                          test_fixtures.OpportunisticDBTestMixin,
+                          test_base.BaseTestCase):
+    FIXTURE = test_fixtures.OpportunisticDbFixture
 
 
 class ModelsMigrationSyncMixin(object):
+
+    def setUp(self):
+        super(ModelsMigrationSyncMixin, self).setUp()
+        self.engine = enginefacade.writer.get_engine()
 
     def get_metadata(self):
         return db.Base.metadata
@@ -413,17 +470,26 @@ class ModelsMigrationSyncMixin(object):
 
 class ModelsMigrationsSyncMysql(ModelsMigrationSyncMixin,
                                 test_migrations.ModelsMigrationsSync,
-                                test_base.MySQLOpportunisticTestCase):
-    pass
+                                test_fixtures.OpportunisticDBTestMixin,
+                                test_base.BaseTestCase):
+    FIXTURE = test_fixtures.MySQLOpportunisticFixture
 
 
 class ModelsMigrationsSyncPostgres(ModelsMigrationSyncMixin,
                                    test_migrations.ModelsMigrationsSync,
-                                   test_base.PostgreSQLOpportunisticTestCase):
-    pass
+                                   test_fixtures.OpportunisticDBTestMixin,
+                                   test_base.BaseTestCase):
+    FIXTURE = test_fixtures.PostgresqlOpportunisticFixture
 
 
-class ModelsMigrationsSyncSqlite(ModelsMigrationSyncMixin,
-                                 test_migrations.ModelsMigrationsSync,
-                                 test_base.DbTestCase):
-    pass
+# NOTE(TheJulia): Sqlite database testing is known to encounter race
+# conditions as the default always falls to the same database which
+# means a different test runner an collide with the test and fail as
+# a result. Commenting out in case we figure out a solid way to
+# prevent this. It should be noted we only test actual databases
+# in ironic's unit tests. Here we're testing databases and sqlite.
+# class ModelsMigrationsSyncSqlite(ModelsMigrationSyncMixin,
+#                                  test_migrations.ModelsMigrationsSync,
+#                                  test_fixtures.OpportunisticDBTestMixin,
+#                                  test_base.BaseTestCase):
+#     FIXTURE = test_fixtures.OpportunisticDbFixture

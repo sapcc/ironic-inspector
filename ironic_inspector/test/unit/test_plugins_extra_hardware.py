@@ -11,35 +11,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
+from unittest import mock
 
-import mock
+from oslo_config import cfg
 
-from ironic_inspector import node_cache
 from ironic_inspector.plugins import extra_hardware
 from ironic_inspector.test import base as test_base
 
 
-@mock.patch.object(extra_hardware.swift, 'SwiftAPI', autospec=True)
-@mock.patch.object(node_cache.NodeInfo, 'patch')
+CONF = cfg.CONF
+
+
+@mock.patch.object(extra_hardware.LOG, 'warning', autospec=True)
 class TestExtraHardware(test_base.NodeTest):
     hook = extra_hardware.ExtraHardwareHook()
 
-    def test_data_recieved(self, patch_mock, swift_mock):
+    def test_data_recieved(self, mock_warn):
         introspection_data = {
             'data': [['memory', 'total', 'size', '4294967296'],
                      ['cpu', 'physical', 'number', '1'],
                      ['cpu', 'logical', 'number', '1']]}
-        data = json.dumps(introspection_data['data'])
         self.hook.before_processing(introspection_data)
         self.hook.before_update(introspection_data, self.node_info)
-
-        swift_conn = swift_mock.return_value
-        name = 'extra_hardware-%s' % self.uuid
-        swift_conn.create_object.assert_called_once_with(name, data)
-        patch_mock.assert_called_once_with(
-            [{'op': 'add', 'path': '/extra/hardware_swift_object',
-              'value': name}])
 
         expected = {
             'memory': {
@@ -58,40 +51,63 @@ class TestExtraHardware(test_base.NodeTest):
         }
 
         self.assertEqual(expected, introspection_data['extra'])
+        self.assertFalse(mock_warn.called)
 
-    def test_data_not_in_edeploy_format(self, patch_mock, swift_mock):
+    def test_data_recieved_with_errors(self, mock_warn):
+        introspection_data = {
+            'data': [['memory', 'total', 'size', '4294967296'],
+                     [],
+                     ['cpu', 'physical', 'number', '1'],
+                     ['cpu', 'physical', 'WUT'],
+                     ['cpu', 'logical', 'number', '1']]}
+        self.hook.before_processing(introspection_data)
+        self.hook.before_update(introspection_data, self.node_info)
+
+        expected = {
+            'memory': {
+                'total': {
+                    'size': 4294967296
+                }
+            },
+            'cpu': {
+                'physical': {
+                    'number': 1
+                },
+                'logical': {
+                    'number': 1
+                },
+            }
+        }
+
+        self.assertEqual(expected, introspection_data['extra'])
+        # An empty list is not a warning, a bad record is.
+        self.assertEqual(1, mock_warn.call_count)
+
+    def test_data_not_in_edeploy_format(self, mock_warn):
         introspection_data = {
             'data': [['memory', 'total', 'size', '4294967296'],
                      ['cpu', 'physical', 'number', '1'],
                      {'interface': 'eth1'}]}
-        data = json.dumps(introspection_data['data'])
         self.hook.before_processing(introspection_data)
         self.hook.before_update(introspection_data, self.node_info)
+        self.assertNotIn('extra', introspection_data)
+        self.assertIn('data', introspection_data)
+        self.assertTrue(mock_warn.called)
 
-        swift_conn = swift_mock.return_value
-        name = 'extra_hardware-%s' % self.uuid
-        swift_conn.create_object.assert_called_once_with(name, data)
-        patch_mock.assert_called_once_with(
-            [{'op': 'add', 'path': '/extra/hardware_swift_object',
-              'value': name}])
-
+    def test_data_not_in_edeploy_format_strict_mode(self, mock_warn):
+        CONF.set_override('strict', True, group='extra_hardware')
+        introspection_data = {
+            'data': [['memory', 'total', 'size', '4294967296'],
+                     ['cpu', 'physical', 'WUT']]
+        }
+        self.hook.before_processing(introspection_data)
+        self.hook.before_update(introspection_data, self.node_info)
+        self.assertNotIn('extra', introspection_data)
         self.assertNotIn('data', introspection_data)
+        self.assertTrue(mock_warn.called)
 
-    def test_no_data_recieved(self, patch_mock, swift_mock):
+    def test_no_data_recieved(self, mock_warn):
         introspection_data = {'cats': 'meow'}
-        swift_conn = swift_mock.return_value
         self.hook.before_processing(introspection_data)
         self.hook.before_update(introspection_data, self.node_info)
-        self.assertFalse(patch_mock.called)
-        self.assertFalse(swift_conn.create_object.called)
-
-    def test__convert_edeploy_data(self, patch_mock, swift_mock):
-        introspection_data = [['Sheldon', 'J.', 'Plankton', '123'],
-                              ['Larry', 'the', 'Lobster', None],
-                              ['Eugene', 'H.', 'Krabs', 'The cashier']]
-
-        data = self.hook._convert_edeploy_data(introspection_data)
-        expected_data = {'Sheldon': {'J.': {'Plankton': 123}},
-                         'Larry': {'the': {'Lobster': None}},
-                         'Eugene': {'H.': {'Krabs': 'The cashier'}}}
-        self.assertEqual(expected_data, data)
+        self.assertTrue(mock_warn.called)

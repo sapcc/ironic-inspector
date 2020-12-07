@@ -11,8 +11,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import mock
+from unittest import mock
 
+from openstack import exceptions
 from oslo_config import cfg
 
 from ironic_inspector import node_cache
@@ -56,7 +57,7 @@ class TestGenericLocalLinkConnectionHook(test_base.NodeTest):
         self.node_info = node_cache.NodeInfo(uuid=self.uuid, started_at=0,
                                              node=self.node, ports=ports)
 
-    @mock.patch.object(node_cache.NodeInfo, 'patch_port')
+    @mock.patch.object(node_cache.NodeInfo, 'patch_port', autospec=True)
     def test_expected_data(self, mock_patch):
         patches = [
             {'path': '/local_link_connection/port_id',
@@ -67,7 +68,7 @@ class TestGenericLocalLinkConnectionHook(test_base.NodeTest):
         self.hook.before_update(self.data, self.node_info)
         self.assertCalledWithPatch(patches, mock_patch)
 
-    @mock.patch.object(node_cache.NodeInfo, 'patch_port')
+    @mock.patch.object(node_cache.NodeInfo, 'patch_port', autospec=True)
     def test_invalid_chassis_id_subtype(self, mock_patch):
         # First byte of TLV value is processed to calculate the subtype for the
         # chassis ID, Subtype 5 ('05...') isn't a subtype supported by this
@@ -81,7 +82,7 @@ class TestGenericLocalLinkConnectionHook(test_base.NodeTest):
         self.hook.before_update(self.data, self.node_info)
         self.assertCalledWithPatch(patches, mock_patch)
 
-    @mock.patch.object(node_cache.NodeInfo, 'patch_port')
+    @mock.patch.object(node_cache.NodeInfo, 'patch_port', autospec=True)
     def test_invalid_port_id_subtype(self, mock_patch):
         # First byte of TLV value is processed to calculate the subtype for the
         # port ID, Subtype 6 ('06...') isn't a subtype supported by this
@@ -95,7 +96,7 @@ class TestGenericLocalLinkConnectionHook(test_base.NodeTest):
         self.hook.before_update(self.data, self.node_info)
         self.assertCalledWithPatch(patches, mock_patch)
 
-    @mock.patch.object(node_cache.NodeInfo, 'patch_port')
+    @mock.patch.object(node_cache.NodeInfo, 'patch_port', autospec=True)
     def test_port_id_subtype_mac(self, mock_patch):
         self.data['inventory']['interfaces'][0]['lldp'][2] = (
             2, '03885a92ec5458')
@@ -108,21 +109,21 @@ class TestGenericLocalLinkConnectionHook(test_base.NodeTest):
         self.hook.before_update(self.data, self.node_info)
         self.assertCalledWithPatch(patches, mock_patch)
 
-    @mock.patch.object(node_cache.NodeInfo, 'patch_port')
+    @mock.patch.object(node_cache.NodeInfo, 'patch_port', autospec=True)
     def test_lldp_none(self, mock_patch):
         self.data['inventory']['interfaces'][0]['lldp'] = None
         patches = []
         self.hook.before_update(self.data, self.node_info)
         self.assertCalledWithPatch(patches, mock_patch)
 
-    @mock.patch.object(node_cache.NodeInfo, 'patch_port')
+    @mock.patch.object(node_cache.NodeInfo, 'patch_port', autospec=True)
     def test_interface_not_in_all_interfaces(self, mock_patch):
         self.data['all_interfaces'] = {}
         patches = []
         self.hook.before_update(self.data, self.node_info)
         self.assertCalledWithPatch(patches, mock_patch)
 
-    @mock.patch.object(node_cache.NodeInfo, 'patch_port')
+    @mock.patch.object(node_cache.NodeInfo, 'patch_port', autospec=True)
     def test_interface_not_in_ironic(self, mock_patch):
         self.node_info._ports = {}
         patches = []
@@ -134,7 +135,7 @@ class TestGenericLocalLinkConnectionHook(test_base.NodeTest):
         self.assertRaises(utils.Error, self.hook.before_update,
                           self.data, self.node_info)
 
-    @mock.patch.object(node_cache.NodeInfo, 'patch_port')
+    @mock.patch.object(node_cache.NodeInfo, 'patch_port', autospec=True)
     def test_no_overwrite(self, mock_patch):
         cfg.CONF.set_override('overwrite_existing', False, group='processing')
         patches = [
@@ -143,3 +144,90 @@ class TestGenericLocalLinkConnectionHook(test_base.NodeTest):
         ]
         self.hook.before_update(self.data, self.node_info)
         self.assertCalledWithPatch(patches, mock_patch)
+
+    @mock.patch.object(node_cache.NodeInfo, 'patch_port', autospec=True)
+    def test_processed_data_available(self, mock_patch):
+        self.data['all_interfaces'] = {
+            'em1': {"ip": self.ips[0], "mac": self.macs[0],
+                    "lldp_processed": {
+                        "switch_chassis_id": "11:22:33:aa:bb:dd",
+                        "switch_port_id": "Ethernet2/66"}
+                    }
+        }
+
+        patches = [
+            {'path': '/local_link_connection/port_id',
+             'value': 'Ethernet2/66', 'op': 'add'},
+            {'path': '/local_link_connection/switch_id',
+             'value': '11:22:33:aa:bb:dd', 'op': 'add'},
+        ]
+        self.hook.before_update(self.data, self.node_info)
+        self.assertCalledWithPatch(patches, mock_patch)
+
+    @mock.patch.object(node_cache.NodeInfo, 'patch_port', autospec=True)
+    def test_processed_data_chassis_only(self, mock_patch):
+        self.data['all_interfaces'] = {
+            'em1': {"ip": self.ips[0], "mac": self.macs[0],
+                    "lldp_processed": {
+                        "switch_chassis_id": "11:22:33:aa:bb:dd"}
+                    }
+        }
+
+        patches = [
+            {'path': '/local_link_connection/switch_id',
+             'value': '11:22:33:aa:bb:dd', 'op': 'add'}
+        ]
+        self.hook.before_update(self.data, self.node_info)
+        self.assertCalledWithPatch(patches, mock_patch)
+
+    @mock.patch.object(node_cache.NodeInfo, 'patch_port', autospec=True)
+    def test_processed_data_port_only(self, mock_patch):
+        self.data['all_interfaces'] = {
+            'em1': {"ip": self.ips[0], "mac": self.macs[0],
+                    "lldp_processed": {
+                        "switch_port_id": "Ethernet2/66"}
+                    }
+        }
+
+        patches = [
+            {'path': '/local_link_connection/port_id',
+             'value': 'Ethernet2/66', 'op': 'add'}
+        ]
+        self.hook.before_update(self.data, self.node_info)
+        self.assertCalledWithPatch(patches, mock_patch)
+
+    @mock.patch.object(node_cache.NodeInfo, 'patch_port', autospec=True)
+    def test_processed_chassis_id_not_mac(self, mock_patch):
+        self.data['all_interfaces'] = {
+            'em1': {"ip": self.ips[0], "mac": self.macs[0],
+                    "lldp_processed": {
+                        "switch_chassis_id": "192.0.2.1",
+                        "switch_port_id": "Ethernet2/66"}
+                    }
+        }
+
+        # skip chassis_id since its not a mac
+        patches = [
+            {'path': '/local_link_connection/port_id',
+             'value': 'Ethernet2/66', 'op': 'add'},
+        ]
+        self.hook.before_update(self.data, self.node_info)
+        self.assertCalledWithPatch(patches, mock_patch)
+
+    @mock.patch('ironic_inspector.plugins.local_link_connection.LOG',
+                autospec=True)
+    @mock.patch.object(node_cache.NodeInfo, 'patch_port', autospec=True)
+    def test_patch_port_exception(self, mock_patch, mock_log):
+        self.data['all_interfaces'] = {
+             'em1': {"ip": self.ips[0], "mac": self.macs[0],
+                     "lldp_processed": {
+                        "switch_chassis_id": "192.0.2.1",
+                        "switch_port_id": "Ethernet2/66"}
+                     }
+        }
+
+        mock_patch.side_effect = exceptions.BadRequestException('invalid data')
+        self.hook.before_update(self.data, self.node_info)
+        log_msg = "Failed to update port %(uuid)s: %(error)s"
+        mock_log.warning.assert_called_with(log_msg, mock.ANY,
+                                            node_info=mock.ANY)

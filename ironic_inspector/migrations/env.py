@@ -12,8 +12,9 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-from alembic import context
 from logging.config import fileConfig
+
+from alembic import context
 
 from ironic_inspector import db
 
@@ -65,8 +66,8 @@ def run_migrations_online():
     and associate a connection with the context.
 
     """
-    connectable = db.create_facade_lazily().get_engine()
-    with connectable.connect() as connection:
+    session = db.get_writer_session()
+    with session.connection() as connection:
         context.configure(
             connection=connection,
             target_metadata=target_metadata
@@ -74,6 +75,7 @@ def run_migrations_online():
 
         with context.begin_transaction():
             context.run_migrations()
+
 
 if context.is_offline_mode():
     run_migrations_offline()

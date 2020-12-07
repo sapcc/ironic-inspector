@@ -13,8 +13,8 @@
 # under the License.
 
 """Tests for introspection rules."""
+from unittest import mock
 
-import mock
 from oslo_utils import uuidutils
 
 from ironic_inspector import db
@@ -41,6 +41,15 @@ class BaseTest(test_base.NodeTest):
             'local_gb': 42,
         }
 
+        self.scope = "inner circle"
+
+    @staticmethod
+    def condition_defaults(condition):
+        condition = condition.copy()
+        condition.setdefault('multiple', 'any')
+        condition.setdefault('invert', False)
+        return condition
+
 
 class TestCreateRule(BaseTest):
     def test_only_actions(self):
@@ -50,7 +59,21 @@ class TestCreateRule(BaseTest):
         self.assertTrue(rule_json.pop('uuid'))
         self.assertEqual({'description': None,
                           'conditions': [],
-                          'actions': self.actions_json},
+                          'actions': self.actions_json,
+                          'scope': None},
+                         rule_json)
+
+    def test_create_action_none_value(self):
+        self.actions_json = [{'action': 'set-attribute',
+                              'path': '/properties/cpus', 'value': None}]
+        rule = rules.create([], self.actions_json)
+        rule_json = rule.as_dict()
+
+        self.assertTrue(rule_json.pop('uuid'))
+        self.assertEqual({'description': None,
+                          'conditions': [],
+                          'actions': self.actions_json,
+                          'scope': None},
                          rule_json)
 
     def test_duplicate_uuid(self):
@@ -60,13 +83,24 @@ class TestCreateRule(BaseTest):
                                uuid=self.uuid)
 
     def test_with_conditions(self):
+        self.conditions_json.extend([
+            # multiple present&default, invert absent
+            {'op': 'eq', 'field': 'local_gb', 'value': 60, 'multiple': 'any'},
+            # multiple absent, invert present&default
+            {'op': 'eq', 'field': 'local_gb', 'value': 60, 'invert': False},
+            # multiple&invert present&non-default
+            {'op': 'eq', 'field': 'memory_mb', 'value': 1024,
+             'multiple': 'all', 'invert': True},
+        ])
         rule = rules.create(self.conditions_json, self.actions_json)
         rule_json = rule.as_dict()
 
         self.assertTrue(rule_json.pop('uuid'))
         self.assertEqual({'description': None,
-                          'conditions': self.conditions_json,
-                          'actions': self.actions_json},
+                          'conditions': [BaseTest.condition_defaults(cond)
+                                         for cond in self.conditions_json],
+                          'actions': self.actions_json,
+                          'scope': None},
                          rule_json)
 
     def test_invalid_condition(self):
@@ -129,6 +163,17 @@ class TestCreateRule(BaseTest):
                                rules.create,
                                self.conditions_json, self.actions_json)
 
+    def test_scope(self):
+        rule = rules.create([], self.actions_json, scope=self.scope)
+        rule_json = rule.as_dict()
+
+        self.assertTrue(rule_json.pop('uuid'))
+        self.assertEqual({'description': None,
+                          'conditions': [],
+                          'actions': self.actions_json,
+                          'scope': self.scope},
+                         rule_json)
+
 
 class TestGetRule(BaseTest):
     def setUp(self):
@@ -140,8 +185,10 @@ class TestGetRule(BaseTest):
 
         self.assertTrue(rule_json.pop('uuid'))
         self.assertEqual({'description': None,
-                          'conditions': self.conditions_json,
-                          'actions': self.actions_json},
+                          'conditions': [BaseTest.condition_defaults(cond)
+                                         for cond in self.conditions_json],
+                          'actions': self.actions_json,
+                          'scope': None},
                          rule_json)
 
     def test_not_found(self):
@@ -390,7 +437,6 @@ class TestApplyActions(BaseTest):
         self.act_mock.apply.assert_any_call(self.node_info, {})
         self.assertEqual(len(self.actions_json),
                          self.act_mock.apply.call_count)
-        self.assertFalse(self.act_mock.rollback.called)
 
     def test_apply_data_format_value(self, mock_ext_mgr):
         self.rule = rules.create(actions_json=[
@@ -404,7 +450,64 @@ class TestApplyActions(BaseTest):
         self.rule.apply_actions(self.node_info, data=self.data)
 
         self.assertEqual(1, self.act_mock.apply.call_count)
-        self.assertFalse(self.act_mock.rollback.called)
+
+    def test_apply_data_format_value_dict(self, mock_ext_mgr):
+        self.data.update({'val_outer': {'val_inner': 17},
+                          'key_outer': {'key_inner': 'baz'}})
+
+        self.rule = rules.create(actions_json=[
+            {'action': 'set-attribute',
+             'path': '/driver_info/foo',
+             'value': {'{data[key_outer][key_inner]}':
+                       '{data[val_outer][val_inner]}'}}],
+            conditions_json=self.conditions_json
+        )
+        mock_ext_mgr.return_value.__getitem__.return_value = self.ext_mock
+
+        self.rule.apply_actions(self.node_info, data=self.data)
+
+        self.act_mock.apply.assert_called_once_with(self.node_info, {
+            # String-formatted values will be coerced to be strings.
+            'value': {'baz': '17'},
+            'path': '/driver_info/foo'
+        })
+
+    def test_apply_data_format_value_list(self, mock_ext_mgr):
+        self.data.update({'outer': {'inner': 'baz'}})
+
+        self.rule = rules.create(actions_json=[
+            {'action': 'set-attribute',
+             'path': '/driver_info/foo',
+             'value': ['basic', ['{data[outer][inner]}']]}],
+            conditions_json=self.conditions_json
+        )
+        mock_ext_mgr.return_value.__getitem__.return_value = self.ext_mock
+
+        self.rule.apply_actions(self.node_info, data=self.data)
+
+        self.act_mock.apply.assert_called_once_with(self.node_info, {
+            'value': ['basic', ['baz']],
+            'path': '/driver_info/foo'
+        })
+
+    def test_apply_data_format_value_primitives(self, mock_ext_mgr):
+        self.data.update({'outer': {'inner': False}})
+
+        self.rule = rules.create(actions_json=[
+            {'action': 'set-attribute',
+             'path': '/driver_info/foo',
+             'value': {42: {True: [3.14, 'foo', '{data[outer][inner]}']}}}],
+            conditions_json=self.conditions_json
+        )
+        mock_ext_mgr.return_value.__getitem__.return_value = self.ext_mock
+
+        self.rule.apply_actions(self.node_info, data=self.data)
+
+        self.act_mock.apply.assert_called_once_with(self.node_info, {
+            # String-formatted values will be coerced to be strings.
+            'value': {42: {True: [3.14, 'foo', 'False']}},
+            'path': '/driver_info/foo'
+        })
 
     def test_apply_data_format_value_fail(self, mock_ext_mgr):
         self.rule = rules.create(
@@ -412,6 +515,19 @@ class TestApplyActions(BaseTest):
                 {'action': 'set-attribute',
                  'path': '/driver_info/ipmi_address',
                  'value': '{data[inventory][bmc_address]}'}],
+            conditions_json=self.conditions_json
+        )
+        mock_ext_mgr.return_value.__getitem__.return_value = self.ext_mock
+
+        self.assertRaises(utils.Error, self.rule.apply_actions,
+                          self.node_info, data=self.data)
+
+    def test_apply_data_format_value_nested_fail(self, mock_ext_mgr):
+        self.data.update({'outer': {'inner': 'baz'}})
+        self.rule = rules.create(actions_json=[
+            {'action': 'set-attribute',
+             'path': '/driver_info/foo',
+             'value': ['basic', ['{data[outer][nonexistent]}']]}],
             conditions_json=self.conditions_json
         )
         mock_ext_mgr.return_value.__getitem__.return_value = self.ext_mock
@@ -431,19 +547,6 @@ class TestApplyActions(BaseTest):
         self.rule.apply_actions(self.node_info, data=self.data)
 
         self.assertEqual(1, self.act_mock.apply.call_count)
-        self.assertFalse(self.act_mock.rollback.called)
-
-    def test_rollback(self, mock_ext_mgr):
-        mock_ext_mgr.return_value.__getitem__.return_value = self.ext_mock
-
-        self.rule.apply_actions(self.node_info, rollback=True)
-
-        self.act_mock.rollback.assert_any_call(self.node_info,
-                                               {'message': 'boom!'})
-        self.act_mock.rollback.assert_any_call(self.node_info, {})
-        self.assertEqual(len(self.actions_json),
-                         self.act_mock.rollback.call_count)
-        self.assertFalse(self.act_mock.apply.called)
 
 
 @mock.patch.object(rules, 'get_all', autospec=True)
@@ -458,7 +561,7 @@ class TestApply(BaseTest):
 
         rules.apply(self.node_info, self.data)
 
-    def test_no_actions(self, mock_get_all):
+    def test_apply(self, mock_get_all):
         mock_get_all.return_value = self.rules
         for idx, rule in enumerate(self.rules):
             rule.check_conditions.return_value = not bool(idx)
@@ -468,44 +571,66 @@ class TestApply(BaseTest):
         for idx, rule in enumerate(self.rules):
             rule.check_conditions.assert_called_once_with(self.node_info,
                                                           self.data)
-            rule.apply_actions.assert_called_once_with(
-                self.node_info, rollback=bool(idx), data=self.data)
+            if rule.check_conditions.return_value:
+                rule.apply_actions.assert_called_once_with(
+                    self.node_info, data=self.data)
+            else:
+                self.assertFalse(rule.apply_actions.called)
 
-    def test_actions(self, mock_get_all):
+
+@mock.patch.object(rules, 'get_all', autospec=True)
+class TestRuleScope(BaseTest):
+    """Test that rules are only applied on the nodes that fall in their scope.
+
+    Check that:
+    - global rule is applied to all nodes
+    - different rules with scopes are applied to different nodes
+    - rule without matching scope is not applied
+    """
+
+    def setUp(self):
+        super(TestRuleScope, self).setUp()
+
+        """
+        rule_global
+        rule_scope_1
+        rule_scope_2
+        rule_out_scope
+        """
+
+        self.rules = [rules.IntrospectionRule("", "", "", "", None),
+                      rules.IntrospectionRule("", "", "", "", "scope_1"),
+                      rules.IntrospectionRule("", "", "", "", "scope_2"),
+                      rules.IntrospectionRule("", "", "", "", "scope_3")]
+        for r in self.rules:
+            r.check_conditions = mock.Mock()
+            r.check_conditions.return_value = True
+            r.apply_actions = mock.Mock()
+            r.apply_actions.return_value = True
+
+    def test_node_no_scope(self, mock_get_all):
         mock_get_all.return_value = self.rules
-        for idx, rule in enumerate(self.rules):
-            rule.check_conditions.return_value = not bool(idx)
-
+        self.node_info.node().properties['inspection_scope'] = None
         rules.apply(self.node_info, self.data)
+        self.rules[0].apply_actions.assert_called_once()  # global
+        self.rules[1].apply_actions.assert_not_called()   # scope_1
+        self.rules[2].apply_actions.assert_not_called()   # scope_2
+        self.rules[3].apply_actions.assert_not_called()   # scope_3
 
-        for idx, rule in enumerate(self.rules):
-            rule.check_conditions.assert_called_once_with(self.node_info,
-                                                          self.data)
-            rule.apply_actions.assert_called_once_with(
-                self.node_info, rollback=bool(idx), data=self.data)
-
-    def test_no_rollback(self, mock_get_all):
+    def test_node_scope_1(self, mock_get_all):
         mock_get_all.return_value = self.rules
-        for rule in self.rules:
-            rule.check_conditions.return_value = True
-
+        self.node_info.node().properties['inspection_scope'] = "scope_1"
         rules.apply(self.node_info, self.data)
+        self.rules[0].apply_actions.assert_called_once()  # global
+        self.rules[1].apply_actions.assert_called_once()   # scope_1
+        self.rules[2].apply_actions.assert_not_called()   # scope_2
+        self.rules[3].apply_actions.assert_not_called()   # scope_3
 
-        for rule in self.rules:
-            rule.check_conditions.assert_called_once_with(self.node_info,
-                                                          self.data)
-            rule.apply_actions.assert_called_once_with(
-                self.node_info, rollback=False, data=self.data)
-
-    def test_only_rollback(self, mock_get_all):
+    def test_node_scope_2(self, mock_get_all):
         mock_get_all.return_value = self.rules
-        for rule in self.rules:
-            rule.check_conditions.return_value = False
-
+        self.node_info.node().properties['inspection_scope'] = "scope_2"
         rules.apply(self.node_info, self.data)
-
-        for rule in self.rules:
-            rule.check_conditions.assert_called_once_with(self.node_info,
-                                                          self.data)
-            rule.apply_actions.assert_called_once_with(
-                self.node_info, rollback=True, data=self.data)
+        self.rules[0].apply_actions.assert_called_once()  # global
+        self.rules[1].apply_actions.assert_not_called()   # scope_1
+        self.rules[2].apply_actions.assert_called_once()   # scope_2
+        self.rules[3].apply_actions.assert_not_called()   # scope_3
