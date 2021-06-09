@@ -1,1 +1,0 @@
-git+https://github.com/stefanhipfel/oslo.messaging@stable/train-m3#egg=oslo.messaging
