@@ -35,7 +35,7 @@ VALID_STATES = {'enroll', 'manageable', 'inspecting', 'inspect wait',
 # inspector is able to use the latest ironic API. In particular, this version
 # is used when processing introspection rules, and is the default version used
 # by processing plugins.
-DEFAULT_IRONIC_API_VERSION = '1.38'
+DEFAULT_IRONIC_API_VERSION = '1.46'
 
 IRONIC_SESSION = None
 
